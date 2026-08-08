@@ -8,8 +8,8 @@
 #   4) 全量明文日志, 变更前后值均记录
 set -uo pipefail
 
-VERSION="1.2.0"
-REPO_RAW="${TRAFMGR_REPO:-https://raw.githubusercontent.com/USER/trafmgr/main/trafmgr.sh}"
+VERSION="1.3.0"
+REPO_RAW="${TRAFMGR_REPO:-https://raw.githubusercontent.com/hahaaa789/LiuLiang/main/LiuLiang}"
 
 # ---------------------------------------------------------------- 路径
 CFG_DIR="${TRAFMGR_CFG_DIR:-/etc/trafmgr}"
@@ -233,11 +233,48 @@ detect_pubip() {
   echo "${ip:-}"
 }
 
+# SSH 端口探测: 多源汇总, 宁可多豁免几个也不能漏
+# 思路是"保命优先"——豁免一个非 SSH 端口只是少限速一点, 漏掉真 SSH 端口会直接失联
+detect_ssh_ports() {
+  local out; out=$(mktemp)
+  # 源1 sshd -T 运行时有效配置 (最权威, 可能多个 Port)
+  sshd -T 2>/dev/null | awk '/^port /{print $2}' >> "$out"
+  # 源2 主配置文件
+  awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/{print $2}' /etc/ssh/sshd_config 2>/dev/null >> "$out"
+  # 源3 include 的子配置 (Debian 12 默认 /etc/ssh/sshd_config.d/*.conf)
+  awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/{print $2}' /etc/ssh/sshd_config.d/*.conf 2>/dev/null >> "$out"
+  # 源4 实际监听: 取 sshd 进程占用的非回环端口
+  ss -tlnpH 2>/dev/null | awk '/sshd/{
+    l=""; for(i=1;i<=NF;i++){ if($i ~ /^users:/) continue; if($i ~ /:[0-9]+$/){ l=$i; break } }
+    if(l==""){next}
+    n=split(l,a,":"); port=a[n]; ad=""
+    for(i=1;i<n;i++) ad = ad a[i]
+    if(ad=="127.0.0.1"||ad=="[::1]"||ad=="::1"||ad ~ /^127\./) next
+    print port }' >> "$out"
+  # 源5 systemd socket 激活 (ssh.socket)
+  systemctl show ssh.socket sshd.socket -p Listen 2>/dev/null \
+    | grep -oE '[0-9]+ ' | tr -d ' ' >> "$out"
+  # 源6 当前 SSH 会话的服务端端口 (你正连着的那个, 最不该漏)
+  if [[ -n ${SSH_CONNECTION:-} ]]; then
+    printf '%s\n' "$(printf '%s' "$SSH_CONNECTION" | awk '{print $4}')" >> "$out"
+  fi
+  # 去重 + 合法性过滤
+  local list; list=$(awk '/^[0-9]+$/ && $1>=1 && $1<=65535' "$out" | sort -un | tr '\n' ' ')
+  rm -f "$out"
+  list=${list% }
+  if [[ -z $list ]]; then
+    list=22
+    logw "SSH 端口探测失败, 回退 22 (限速将只豁免 22)"
+  fi
+  echo "$list"
+}
+# 首选端口 (用于显示): 优先取 sshd -T 权威值, 否则取豁免列表首个
 detect_ssh_port() {
   local p
-  p=$(sshd -T 2>/dev/null | awk '/^port /{print $2}' | head -1)
-  [[ -z $p ]] && p=$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/{print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)
-  [[ -z $p ]] && { p=22; logw "SSH 端口探测失败, 回退 22"; }
+  p=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')
+  [[ $p =~ ^[0-9]+$ ]] || p=$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/{print $2; exit}' /etc/ssh/sshd_config 2>/dev/null)
+  [[ $p =~ ^[0-9]+$ ]] || p=$(detect_ssh_ports | awk '{print $1}')
+  [[ $p =~ ^[0-9]+$ ]] || p=22
   echo "$p"
 }
 
@@ -273,7 +310,7 @@ cfg_defaults() {
   RESET_DAY=1; QUOTA=0; QUOTA_BASIS=total
   COLLECT_INTERVAL=5; AUTO_DISCOVER=1; COUNT_FORWARD=1
   ENFORCE_HOST=0; ENFORCE_HOST_AT=100; ENFORCE_HOST_RATE=1M
-  ENFORCE_PORT=0; ENFORCE_PORT_RATE=1M; RESET_CLEAR_LIMITS=1
+  ENFORCE_PORT=0; ENFORCE_PORT_RATE=1M; PQUOTA_BASIS=total; RESET_CLEAR_LIMITS=1
   STALE_KEEP_DAYS=30
   NFT_TABLE=$NFT_TABLE_DEFAULT
   LOG_LEVEL=$LOG_LEVEL_DEFAULT; LOG_KEEP=$LOG_KEEP_DEFAULT; AUDIT_KEEP=$AUDIT_KEEP_DEFAULT
@@ -288,11 +325,11 @@ cfg_read() {
     k=${line%%=*}; v=${line#*=}
     k=${k//[[:space:]]/}
     v=${v%\"}; v=${v#\"}; v=${v%\'}; v=${v#\'}
-    [[ $v =~ ^[A-Za-z0-9._/:+-]*$ ]] || { logw "配置项 $k 含非法字符, 已忽略"; continue; }
+    [[ $v =~ ^[A-Za-z0-9._/:+,-]*$ ]] || { logw "配置项 $k 含非法字符, 已忽略"; continue; }
     case $k in
       IFACE|PUBLIC_IP|SSH_PORT|RESET_DAY|QUOTA|QUOTA_BASIS|COLLECT_INTERVAL|\
       AUTO_DISCOVER|COUNT_FORWARD|ENFORCE_HOST|ENFORCE_HOST_AT|ENFORCE_HOST_RATE|\
-      ENFORCE_PORT|ENFORCE_PORT_RATE|RESET_CLEAR_LIMITS|STALE_KEEP_DAYS|NFT_TABLE|\
+      ENFORCE_PORT|ENFORCE_PORT_RATE|PQUOTA_BASIS|RESET_CLEAR_LIMITS|STALE_KEEP_DAYS|NFT_TABLE|\
       LOG_LEVEL|LOG_KEEP|AUDIT_KEEP)
         printf -v "$k" '%s' "$v" ;;
       *) logw "未知配置项 $k, 已忽略" ;;
@@ -307,6 +344,7 @@ cfg_read() {
   [[ $LOG_KEEP =~ ^[0-9]+$ ]] && (( LOG_KEEP >= 50 )) || LOG_KEEP=300
   [[ $AUDIT_KEEP =~ ^[0-9]+$ ]] && (( AUDIT_KEEP >= 50 )) || AUDIT_KEEP=1000
   case $QUOTA_BASIS in up|down|total|max) ;; *) QUOTA_BASIS=total ;; esac
+  case $PQUOTA_BASIS in up|down|total|max) ;; *) PQUOTA_BASIS=total ;; esac
   case $LOG_LEVEL in DEBUG|INFO|WARN|ERROR) ;; *) LOG_LEVEL=INFO ;; esac
   local b
   for b in AUTO_DISCOVER COUNT_FORWARD ENFORCE_HOST ENFORCE_PORT RESET_CLEAR_LIMITS; do
@@ -317,13 +355,26 @@ cfg_load() {
   cfg_defaults
   cfg_read
   RIFACE=$IFACE;  [[ $IFACE   == auto ]] && RIFACE=$(detect_iface)
-  RSSH=$SSH_PORT; [[ $SSH_PORT == auto ]] && RSSH=$(detect_ssh_port)
+  if [[ $SSH_PORT == auto ]]; then
+    RSSH_LIST=$(detect_ssh_ports)
+    RSSH=$(detect_ssh_port)
+  else
+    # 手动指定: 以手写为准, 但仍并入自动探测结果 (只增不减, 避免漏豁免导致失联)
+    local _man="${SSH_PORT//,/ }"
+    RSSH_LIST=$(printf '%s %s\n' "$_man" "$(detect_ssh_ports)" | tr ' ' '\n' \
+      | awk '/^[0-9]+$/ && $1>=1 && $1<=65535' | sort -un | tr '\n' ' ')
+    RSSH_LIST=${RSSH_LIST% }
+    RSSH=$(printf '%s' "$_man" | awk '{print $1}')
+  fi
+  [[ -n ${RSSH_LIST:-} ]] || RSSH_LIST=22
+  [[ $RSSH =~ ^[0-9]+$ ]] || RSSH=22
   RIP=$PUBLIC_IP; [[ $PUBLIC_IP == auto ]] && RIP=$(detect_pubip "$RIFACE")
 }
 cfg_save() {
   mkdir -p "$CFG_DIR"
   cat > "$CFG" <<EOF
 # trafmgr 配置  v$VERSION   auto = 运行时自动探测
+# SSH_PORT 可写 auto, 或逗号分隔多个端口如 22,22123 (仍会并入自动探测结果)
 IFACE=$IFACE
 PUBLIC_IP=$PUBLIC_IP
 SSH_PORT=$SSH_PORT
@@ -338,6 +389,7 @@ ENFORCE_HOST_AT=$ENFORCE_HOST_AT
 ENFORCE_HOST_RATE=$ENFORCE_HOST_RATE
 ENFORCE_PORT=$ENFORCE_PORT
 ENFORCE_PORT_RATE=$ENFORCE_PORT_RATE
+PQUOTA_BASIS=$PQUOTA_BASIS
 RESET_CLEAR_LIMITS=$RESET_CLEAR_LIMITS
 STALE_KEEP_DAYS=$STALE_KEEP_DAYS
 NFT_TABLE=$NFT_TABLE
@@ -466,6 +518,9 @@ nft_build() {
   nft_ok || { loge "未找到 nft, 无法建立端口计数"; return 1; }
   local tmp; tmp=$(mktemp)
   {
+    # 原子替换: 声明->删除->重建 全部在同一 nft 事务内, 无空窗期
+    echo "table inet $t"
+    echo "delete table inet $t"
     echo "table inet $t {"
     echo "  chain local_in  { type filter hook input       priority -150; policy accept;"
     while IFS=$'\t' read -r _k proto port kind note src first state last; do
@@ -503,7 +558,6 @@ nft_build() {
     fi
     echo "}"
   } > "$tmp"
-  nft list table inet "$t" >/dev/null 2>&1 && nft delete table inet "$t" 2>/dev/null
   if nft -f "$tmp" 2>>"$LOG"; then
     snap_drop_ports
     mkdir -p "$STATE_DIR"; ports_fingerprint > "$STATE_DIR/ports.fp"
@@ -550,6 +604,22 @@ collect_ports() {
   echo "$n"
 }
 
+# 安全重建: 任何会改变计数表结构的操作都必须走这里
+# 1) 先把旧表当前计数落账, 避免重建清零导致丢数
+# 2) 重建
+# 3) 立刻读一次新表建立基线, 避免下一轮把新表值当增量
+nft_rebuild_safe() {
+  local t=${NFT_TABLE:-$NFT_TABLE_DEFAULT} n=0
+  if nft list table inet "$t" >/dev/null 2>&1; then
+    n=$(collect_ports)
+    logd "重建前已落账 $n 项端口计数"
+  fi
+  nft_build || return 1
+  collect_ports >/dev/null
+  logd "重建后已建立新基线"
+  return 0
+}
+
 # ---------------------------------------------------------------- 端口注册
 port_add() {   # proto port kind note src
   local proto=$1 port=$2 kind=$3 note=${4:--} src=${5:-auto} k now
@@ -574,11 +644,28 @@ port_add() {   # proto port kind note src
   audit "新增端口 $k  类型=$kind  来源=$src  备注=$note"
   return 0
 }
+# 删除端口时连带清理该端口的配额与限速规则, 避免孤立残留
+port_purge_refs() {
+  local k=$1 n=0 lk proto port dirn rate st src
+  if [[ -n $(tsv_get "$k" "$PQUOTA") ]]; then
+    local ov; ov=$(tsv_get "$k" "$PQUOTA" | cut -f2)
+    tsv_del "$PQUOTA" "$k"; audit "连带移除端口配额 $k  原值=$(fmt_bytes "${ov:-0}")"
+  fi
+  while IFS=$'\t' read -r lk proto port dirn rate st src; do
+    [[ -z ${lk:-} ]] && continue
+    [[ $lk == "${k}_"* ]] || continue
+    tsv_del "$LIMITS" "$lk"; n=$(( n + 1 ))
+    audit "连带移除限速规则 $lk"
+  done < <(cat "$LIMITS" 2>/dev/null)
+  (( n > 0 )) && nft_limit_build
+  return 0
+}
 port_del() {
   local k=$1 ex; ex=$(tsv_get "$k" "$PORTS")
   [[ -z $ex ]] && return 1
   tsv_del "$PORTS" "$k"
   audit "删除端口 $k  原记录=[$(printf '%s' "$ex" | tr '\t' '|')]"
+  port_purge_refs "$k"
 }
 port_mark_gone() {
   local k=$1 ex; ex=$(tsv_get "$k" "$PORTS")
@@ -607,6 +694,7 @@ port_gc() {
     (( u + d > 0 )) && continue
     tsv_del "$PORTS" "$k"
     audit "自动清理端口 $k  已下线超过 ${keep} 天且本周期无流量"
+    port_purge_refs "$k"
     n=$(( n + 1 ))
   done < <(cat "$PORTS" 2>/dev/null)
   (( n > 0 )) && logi "端口清理完成, 移除 $n 个陈旧条目"
@@ -745,6 +833,21 @@ basis_name() {
     up) echo "仅上传";; down) echo "仅下载";; max) echo "取上下较大";; *) echo "合计";;
   esac
 }
+# 端口配额独立口径: 与整机配额分开, 避免改整机口径时静默改变端口判定
+pbasis_value() {
+  local u=$1 d=$2
+  case ${PQUOTA_BASIS:-total} in
+    up)   echo "$u" ;;
+    down) echo "$d" ;;
+    max)  (( u > d )) && echo "$u" || echo "$d" ;;
+    *)    echo $(( u + d )) ;;
+  esac
+}
+pbasis_name() {
+  case ${PQUOTA_BASIS:-total} in
+    up) echo "仅上传";; down) echo "仅下载";; max) echo "取上下较大";; *) echo "上传+下载合计";;
+  esac
+}
 
 # ---------------------------------------------------------------- 限速 (nft limit)
 LIMIT_TABLE_SUFFIX="_lim"
@@ -758,10 +861,15 @@ nft_limit_build() {
   fi
   local tmp; tmp=$(mktemp)
   {
+    echo "table inet $t"
+    echo "delete table inet $t"
     echo "table inet $t {"
     echo "  chain lim_out { type filter hook output priority 100; policy accept;"
-    echo "    tcp sport ${RSSH} accept"
-    echo "    tcp dport ${RSSH} accept"
+    local sp
+    for sp in ${RSSH_LIST:-$RSSH}; do
+      echo "    tcp sport $sp accept"
+      echo "    tcp dport $sp accept"
+    done
     while IFS=$'\t' read -r key proto port dirn rate st src; do
       [[ -z ${key:-} || ${st:-} != on ]] && continue
       [[ $dirn == out || $dirn == both ]] || continue
@@ -770,8 +878,10 @@ nft_limit_build() {
     done < <(cat "$LIMITS" 2>/dev/null)
     echo "  }"
     echo "  chain lim_in { type filter hook input priority 100; policy accept;"
-    echo "    tcp dport ${RSSH} accept"
-    echo "    tcp sport ${RSSH} accept"
+    for sp in ${RSSH_LIST:-$RSSH}; do
+      echo "    tcp dport $sp accept"
+      echo "    tcp sport $sp accept"
+    done
     while IFS=$'\t' read -r key proto port dirn rate st src; do
       [[ -z ${key:-} || ${st:-} != on ]] && continue
       [[ $dirn == in || $dirn == both ]] || continue
@@ -781,9 +891,8 @@ nft_limit_build() {
     echo "  }"
     echo "}"
   } > "$tmp"
-  nft list table inet "$t" >/dev/null 2>&1 && nft delete table inet "$t" 2>/dev/null
   if nft -f "$tmp" 2>>"$LOG"; then
-    audit "限速表已应用 生效规则=$(awk -F'\t' '$6=="on"' "$LIMITS" 2>/dev/null | grep -c .) SSH豁免=$RSSH"
+    audit "限速表已应用 生效规则=$(awk -F'\t' '$6=="on"' "$LIMITS" 2>/dev/null | grep -c .) SSH豁免=${RSSH_LIST:-$RSSH}"
     rm -f "$tmp"; return 0
   else
     loge "限速表应用失败, 规则保留于 $tmp"; return 1
@@ -792,7 +901,10 @@ nft_limit_build() {
 limit_add() {   # proto port dir rate [src]
   local proto=$1 port=$2 dirn=$3 rate=$4 src=${5:-manual} k
   k="$(pkey "$proto" "$port")_$dirn"
-  [[ $port == "$RSSH" ]] && { echo "  拒绝: $port 是 SSH 端口, 不可限速"; audit "拒绝对 SSH 端口 $port 限速"; return 1; }
+  local sp
+  for sp in ${RSSH_LIST:-$RSSH}; do
+    [[ $port == "$sp" ]] && { echo "  拒绝: $port 在 SSH 豁免列表中, 不可限速"; audit "拒绝对 SSH 豁免端口 $port 限速"; return 1; }
+  done
   tsv_put "$LIMITS" "$k" "$proto" "$port" "$dirn" "$rate" on "$src"
   audit "新增限速 $k  速率=$rate  方向=$dirn  来源=$src"
   nft_limit_build
@@ -855,25 +967,26 @@ enforce_clear() {
 enforce_apply_host() {
   local rate=$1 t="${NFT_TABLE:-$NFT_TABLE_DEFAULT}_enf" kbs
   kbs=$(parse_rate_kbs "$rate"); [[ $kbs == ERR ]] && { loge "整机限速速率非法: $rate"; return 1; }
-  local tmp; tmp=$(mktemp)
+  local tmp exo exi sp; tmp=$(mktemp); exo=""; exi=""
+  for sp in ${RSSH_LIST:-$RSSH}; do
+    exo+="    tcp sport $sp accept"$'\n'"    tcp dport $sp accept"$'\n'
+    exi+="    tcp dport $sp accept"$'\n'"    tcp sport $sp accept"$'\n'
+  done
   cat > "$tmp" <<EOF
+table inet $t
+delete table inet $t
 table inet $t {
   chain enf_out { type filter hook output priority 110; policy accept;
-    tcp sport $RSSH accept
-    tcp dport $RSSH accept
-    limit rate over $kbs kbytes/second burst 64 kbytes drop
+${exo}    limit rate over $kbs kbytes/second burst 64 kbytes drop
   }
   chain enf_in { type filter hook input priority 110; policy accept;
-    tcp dport $RSSH accept
-    tcp sport $RSSH accept
-    limit rate over $kbs kbytes/second burst 64 kbytes drop
+${exi}    limit rate over $kbs kbytes/second burst 64 kbytes drop
   }
 }
 EOF
-  nft list table inet "$t" >/dev/null 2>&1 && nft delete table inet "$t" 2>/dev/null
   if nft -f "$tmp" 2>>"$LOG"; then
     mkdir -p "$STATE_DIR"; echo "整机 $rate  触发于 $(date '+%F %T')" > "$ENF_STATE"
-    audit "触发整机超额限速  速率=$rate  SSH豁免=$RSSH"
+    audit "触发整机超额限速  速率=$rate  SSH豁免=${RSSH_LIST:-$RSSH}"
     rm -f "$tmp"; return 0
   else
     loge "整机超额限速应用失败, 规则保留于 $tmp"; return 1
@@ -889,14 +1002,16 @@ enforce_check_ports() {
     [[ $q =~ ^[0-9]+$ ]] || continue
     (( q == 0 )) && continue
     read -r u d <<<"$(acc_get "$k" "$CYCLE")"
-    used=$(basis_value "$u" "$d")
+    used=$(pbasis_value "$u" "$d")
     (( used < q )) && continue
     port=${k%%/*}; proto=${k##*/}
-    [[ $port == "$RSSH" ]] && continue
+    local skip=0 sp
+    for sp in ${RSSH_LIST:-$RSSH}; do [[ $port == "$sp" ]] && skip=1; done
+    (( skip == 1 )) && continue
     lk="${k}_both"
     [[ -n $(tsv_get "$lk" "$LIMITS") ]] && continue
     tsv_put "$LIMITS" "$lk" "$proto" "$port" both "${ENFORCE_PORT_RATE:-1M}" on "$ENF_TAG"
-    audit "端口 $k 用量 $(fmt_bytes "$used") 达配额 $(fmt_bytes "$q"), 自动限速至 ${ENFORCE_PORT_RATE:-1M}"
+    audit "端口 $k 用量 $(fmt_bytes "$used") (口径 $(pbasis_name)) 达配额 $(fmt_bytes "$q"), 自动限速至 ${ENFORCE_PORT_RATE:-1M}"
     n=$(( n + 1 ))
   done < <(cat "$PQUOTA" 2>/dev/null)
   (( n > 0 )) && nft_limit_build
@@ -1066,9 +1181,9 @@ show_ports() {
     state=$(printf '%s' "$pline" | cut -f8)
     case $kind in local) kind=本机;; fwd) kind=转发;; redir) kind=跳跃;; *) kind=未知;; esac
     [[ ${state:-live} == gone ]] && mark=" [已下线]"
-    [[ $k == "${RSSH:-}/tcp" ]] && note="SSH ${note:-}"
+    local sp2; for sp2 in ${RSSH_LIST:-${RSSH:-}}; do [[ $k == "$sp2/tcp" ]] && note="SSH ${note:-}"; done
     q=$(pquota_get "$k")
-    (( q > 0 )) && mark="$mark [配额 $(fmt_bytes "$q") $(pct_str "$(basis_value "$u" "$d")" "$q")]"
+    (( q > 0 )) && mark="$mark [配额 $(fmt_bytes "$q") $(pct_str "$(pbasis_value "$u" "$d")" "$q")]"
     printf '  %s %s %s %s %s %s  %s\n' "$(padr "$k" 17)" "$(padr "$kind" 4)" \
       "$(padl "$(fmt_bytes "$u")" 13)" "$(padl "$(fmt_bytes "$d")" 13)" "$(padl "$(fmt_bytes "$((u+d))")" 13)" \
       "$(padl "$(pct_str "$((u+d))" "$ptot")" 7)" "${note:--}$mark"
@@ -1184,10 +1299,25 @@ menu_quota() {
          ask_size "输入本期已用下载量" "$(fmt_bytes "$d")" || continue; cd=$SIZE_VAL
          tsv_put "$CYCLE" nic "$cu" "$cd"
          audit "手动校准本期用量  原值 上传=$u 下载=$d  新值 上传=$cu 下载=$cd"
-         echo "  已校准"; pause ;;
+         # 校准后若已低于阈值, 解除整机限速让其可重新触发
+         if [[ -f $ENF_STATE && ${QUOTA:-0} -gt 0 ]]; then
+           local nu; nu=$(basis_value "$cu" "$cd")
+           if (( nu < QUOTA * ${ENFORCE_HOST_AT:-100} / 100 )); then
+             enforce_clear "手动校准后用量低于阈值"
+             echo "  已校准, 用量低于阈值, 已解除超额限速"
+           else echo "  已校准"; fi
+         else echo "  已校准"; fi
+         pause ;;
       5) if confirm_danger "将清零本期统计, 此操作不可撤销"; then
            audit "手动重置本期计数  原值 上传=$u 下载=$d"
-           : > "$CYCLE"; echo "  已重置"
+           : > "$CYCLE"
+           # 用量归零后阈值必然不再满足, 同步解除限速, 避免限速卡死
+           if [[ ${RESET_CLEAR_LIMITS:-1} == 1 ]]; then
+             enforce_clear "手动重置本期计数"
+             echo "  已重置, 并已解除超额限速"
+           else
+             echo "  已重置 (周期重置自动解除已关闭, 超额限速仍保留)"
+           fi
          else echo "  已取消"; fi; pause ;;
       0|"") return ;;
       *) echo "  无效选择"; pause ;;
@@ -1203,16 +1333,18 @@ menu_enforce() {
     printf '    A. 整机限制                        %s\n' "$( [[ ${ENFORCE_HOST:-0} == 1 ]] && printf '%s开启%s' "$C_G" "$C_R" || echo 关闭 )"
     printf '       触发   本期用量(按%s) >= %s%% 配额 %s\n' "$(basis_name)" "${ENFORCE_HOST_AT:-100}" "$( (( ${QUOTA:-0} > 0 )) && fmt_bytes "$QUOTA" || echo 未设置 )"
     printf '       动作   整机限速 %s  出站 + 入站\n' "${ENFORCE_HOST_RATE:-1M}"
-    printf '       豁免   SSH %s/tcp 永不限速   [强制]\n' "$RSSH"
+    printf '       豁免   SSH %s (tcp) 永不限速   [强制]\n' "${RSSH_LIST:-$RSSH}"
     echo
     printf '    B. 单端口限制                      %s\n' "$( [[ ${ENFORCE_PORT:-0} == 1 ]] && printf '%s开启%s' "$C_G" "$C_R" || echo 关闭 )"
     printf '       动作   超配额端口自动限速至 %s (双向)\n' "${ENFORCE_PORT_RATE:-1M}"
+    printf '       口径   %s   [独立于整机配额口径]\n' "$(pbasis_name)"
+    printf '       %s注意 端口计数为该端口经手流量; 转发端口每 1GB 经手约消耗网卡 2GB%s\n' "$C_D" "$C_R"
     local nq=0
     while IFS=$'\t' read -r k q; do
       [[ -z ${k:-} ]] && continue
       nq=$(( nq + 1 ))
       local pu pd pused
-      read -r pu pd <<<"$(acc_get "$k" "$CYCLE")"; pused=$(basis_value "$pu" "$pd")
+      read -r pu pd <<<"$(acc_get "$k" "$CYCLE")"; pused=$(pbasis_value "$pu" "$pd")
       printf '       %-16s 配额 %12s   已用 %12s  %s%s\n' "$k" "$(fmt_bytes "$q")" "$(fmt_bytes "$pused")" \
         "$(pct_str "$pused" "$q")" "$( (( pused >= q )) && printf ' %s超限%s' "$C_E" "$C_R" )"
     done < <(cat "$PQUOTA" 2>/dev/null)
@@ -1229,8 +1361,9 @@ menu_enforce() {
     echo "    4)  端口限制  开关"
     echo "    5)  端口限制  限速速率"
     echo "    6)  端口配额  增 / 改 / 删"
-    echo "    7)  周期重置自动解除  开关"
-    echo "    8)  立即解除全部超额限速"
+    echo "    7)  端口配额  计费口径"
+    echo "    8)  周期重置自动解除  开关"
+    echo "    9)  立即解除全部超额限速"
     echo "    0)  返回"
     printf '\n  回车返回\n  请选择: '; read -r c
     case ${c:-0} in
@@ -1238,7 +1371,7 @@ menu_enforce() {
            cfg_set ENFORCE_HOST 0; enforce_clear "用户关闭整机限制"; echo "  已关闭"
          else
            (( ${QUOTA:-0} == 0 )) && { echo "  未设置配额, 无法开启整机限制, 请先在菜单 2 设置"; pause; continue; }
-           confirm_danger "开启后, 用量达阈值将自动限速全机 (SSH $RSSH 除外)" && { cfg_set ENFORCE_HOST 1; echo "  已开启"; }
+           confirm_danger "开启后, 用量达阈值将自动限速全机 (SSH ${RSSH_LIST:-$RSSH} 除外)" && { cfg_set ENFORCE_HOST 1; echo "  已开启"; }
          fi; pause ;;
       2) ask "阈值百分比 (如 100 表示用满配额时触发)" "${ENFORCE_HOST_AT:-100}"
          if [[ $REPLY_VAL =~ ^[0-9]+$ ]] && (( REPLY_VAL >= 1 && REPLY_VAL <= 500 )); then
@@ -1249,12 +1382,20 @@ menu_enforce() {
            cfg_set ENFORCE_PORT 0; enforce_clear "用户关闭端口限制"; echo "  已关闭"
          else
            (( $(nlines "$PQUOTA") == 0 )) && { echo "  尚未设置任何端口配额, 请先用选项 6 添加"; pause; continue; }
-           confirm_danger "开启后, 超配额端口将自动限速 (SSH $RSSH 除外)" && { cfg_set ENFORCE_PORT 1; echo "  已开启"; }
+           confirm_danger "开启后, 超配额端口将自动限速 (SSH ${RSSH_LIST:-$RSSH} 除外)" && { cfg_set ENFORCE_PORT 1; echo "  已开启"; }
          fi; pause ;;
       5) ask_rate "端口限速速率 (如 1M / 500K)" "${ENFORCE_PORT_RATE:-1M}" && cfg_set ENFORCE_PORT_RATE "$RATE_VAL" ;;
       6) menu_pquota ;;
-      7) [[ ${RESET_CLEAR_LIMITS:-1} == 1 ]] && cfg_set RESET_CLEAR_LIMITS 0 || cfg_set RESET_CLEAR_LIMITS 1 ;;
-      8) enforce_clear "用户手动解除"; echo "  已解除"; pause ;;
+      7) echo; echo "    端口配额按哪个数字判定 (与整机配额口径互相独立)"
+         echo "    1) 仅上传   2) 仅下载   3) 上传+下载合计   4) 取上下较大"
+         ask "选择口径" "3"
+         case $REPLY_VAL in
+           1) cfg_set PQUOTA_BASIS up;; 2) cfg_set PQUOTA_BASIS down;;
+           3) cfg_set PQUOTA_BASIS total;; 4) cfg_set PQUOTA_BASIS max;;
+           *) echo "  无效选择"; pause;;
+         esac ;;
+      8) [[ ${RESET_CLEAR_LIMITS:-1} == 1 ]] && cfg_set RESET_CLEAR_LIMITS 0 || cfg_set RESET_CLEAR_LIMITS 1 ;;
+      9) enforce_clear "用户手动解除"; echo "  已解除"; pause ;;
       0|"") return ;;
       *) echo "  无效选择"; pause ;;
     esac
@@ -1265,6 +1406,8 @@ menu_pquota() {
   while :; do
     cfg_load
     title "端口配额     超出后由「端口限制」自动限速"
+    printf '  判定口径 %s   本期用量与配额比对\n' "$(pbasis_name)"
+    printf '  %s端口计数为该端口经手流量, 非网卡消耗。转发端口经手 1GB 约消耗网卡 2GB%s\n' "$C_D" "$C_R"
     hr
     printf '  %-18s %14s %14s %8s\n' 端口 配额 本期已用 占比
     local n=0
@@ -1272,7 +1415,7 @@ menu_pquota() {
       [[ -z ${k:-} ]] && continue
       n=$(( n + 1 ))
       local pu pd pused
-      read -r pu pd <<<"$(acc_get "$k" "$CYCLE")"; pused=$(basis_value "$pu" "$pd")
+      read -r pu pd <<<"$(acc_get "$k" "$CYCLE")"; pused=$(pbasis_value "$pu" "$pd")
       printf '  %-18s %14s %14s %8s\n' "$k" "$(fmt_bytes "$q")" "$(fmt_bytes "$pused")" "$(pct_str "$pused" "$q")"
     done < <(cat "$PQUOTA" 2>/dev/null)
     (( n == 0 )) && printf '  %s暂无端口配额%s\n' "$C_D" "$C_R"
@@ -1286,8 +1429,11 @@ menu_pquota() {
          echo "    1) tcp   2) udp"; ask "协议" "1"
          local pr; [[ $REPLY_VAL == 2 ]] && pr=udp || pr=tcp
          local k; k=$(pkey "$pr" "$PORT_VAL")
-         [[ $PORT_VAL == "$RSSH" ]] && { echo "  拒绝: SSH 端口不参与超额限速"; pause; continue; }
+         local isssh=0 sp
+         for sp in ${RSSH_LIST:-$RSSH}; do [[ $PORT_VAL == "$sp" ]] && isssh=1; done
+         (( isssh == 1 )) && { echo "  拒绝: $PORT_VAL 在 SSH 豁免列表中, 不参与超额限速"; pause; continue; }
          [[ -z $(tsv_get "$k" "$PORTS") ]] && echo "  提示: $k 尚未在监控清单中, 配额将在该端口被发现后生效"
+         echo "  当前判定口径: $(pbasis_name)"
          ask_size "配额额度 (如 500G / 2T, 输入 0 表示移除)" "" || continue
          pquota_set "$k" "$SIZE_VAL"; echo "  已设置"; pause ;;
       2) ask "输入要删除的端口 (格式 端口/协议, 如 443/tcp)" ""
@@ -1317,7 +1463,7 @@ menu_limits() {
         "$( [[ ${src:-manual} == "$ENF_TAG" ]] && printf '%s超额自动%s' "$C_E" "$C_R" || echo 手动 )"
     done < <(cat "$LIMITS" 2>/dev/null)
     (( i == 0 )) && printf '  %s暂无限速规则%s\n' "$C_D" "$C_R"
-    printf '  %-22s %-10s %-6s %10s %8s  %s\n' "-" "$RSSH/tcp" "-" "-" "-" "SSH 豁免, 不可限速"
+    printf '  %-22s %-10s %-6s %10s %8s  %s\n' "-" "${RSSH_LIST:-$RSSH}" "-" "-" "-" "SSH 豁免列表, 不可限速"
     hr
     echo "    1)  新增限速规则"
     echo "    2)  删除限速规则"
@@ -1361,14 +1507,14 @@ menu_portlist() {
       n=$((n+1))
       local kd st
       case $kind in local) kd=本机;; fwd) kd=转发;; redir) kd=跳跃;; *) kd=$kind;; esac
-      [[ $k == "$RSSH/tcp" ]] && kd="$kd*"
+      local sp; for sp in ${RSSH_LIST:-$RSSH}; do [[ $k == "$sp/tcp" ]] && kd="$kd*"; done
       if [[ ${state:-live} == gone ]]; then st="${C_D}已下线${C_R}"; ngone=$((ngone+1)); else st="${C_G}在线${C_R}"; fi
       printf '  %-16s %-6s %-8s %-6s %-20s %s\n' "$k" "$kd" "$src" "$st" "${note:--}" "${last:-未知}"
     done < <(sort -t$'\t' -k3,3n "$PORTS" 2>/dev/null)
     (( n == 0 )) && printf '  %s暂无端口, 下次采集将自动发现%s\n' "$C_D" "$C_R"
     hr
     printf '  共 %d 个   其中已下线 %d 个   自动清理: 下线超过 %s 天且本周期无流量\n' "$n" "$ngone" "${STALE_KEEP_DAYS:-30}"
-    printf '  %s标 * 者为 SSH 端口, 限速时强制豁免。手动添加的端口不会被自动下线%s\n' "$C_D" "$C_R"
+    printf '  %s标 * 者在 SSH 豁免列表 (%s), 限速时强制豁免。手动添加的端口不会被自动下线%s\n' "$C_D" "${RSSH_LIST:-$RSSH}" "$C_R"
     echo
     echo "    1)  手动添加端口"
     echo "    2)  删除端口"
@@ -1386,20 +1532,20 @@ menu_portlist() {
          local kd; [[ $REPLY_VAL == 2 ]] && kd=fwd || kd=local
          ask "备注 (可选)" "-"; local nt=${REPLY_VAL:--}
          if port_add "$pr" "$PORT_VAL" "$kd" "$nt" manual; then
-           nft_build; echo "  已添加并生效"
+           nft_rebuild_safe; echo "  已添加并生效"
          else echo "  该端口已在清单中"; fi
          pause ;;
       2) ask "输入要删除的端口 (格式 端口/协议, 如 8443/tcp)" ""; [[ -z $REPLY_VAL ]] && continue
-         if port_del "$REPLY_VAL"; then nft_build; echo "  已删除"; else echo "  未找到"; fi; pause ;;
+         if port_del "$REPLY_VAL"; then nft_rebuild_safe; echo "  已删除"; else echo "  未找到"; fi; pause ;;
       3) [[ ${AUTO_DISCOVER:-1} == 1 ]] && cfg_set AUTO_DISCOVER 0 || cfg_set AUTO_DISCOVER 1 ;;
-      4) do_discover; nft_build; echo "  扫描完成"; pause ;;
+      4) do_discover; nft_rebuild_safe; echo "  扫描完成"; pause ;;
       5) local m=0
          while IFS=$'\t' read -r k proto port kind note src first state last; do
            [[ -z ${k:-} ]] && continue
            [[ ${state:-live} == gone ]] || continue
-           tsv_del "$PORTS" "$k"; audit "手动清理已下线端口 $k"; m=$((m+1))
+           tsv_del "$PORTS" "$k"; audit "手动清理已下线端口 $k"; port_purge_refs "$k"; m=$((m+1))
          done < <(cat "$PORTS" 2>/dev/null)
-         (( m > 0 )) && nft_build
+         (( m > 0 )) && nft_rebuild_safe
          echo "  已清理 $m 个"; pause ;;
       6) ask "已下线端口保留天数 (0 = 永不自动清理)" "${STALE_KEEP_DAYS:-30}"
          [[ $REPLY_VAL =~ ^[0-9]+$ ]] && cfg_set STALE_KEEP_DAYS "$REPLY_VAL" || { echo "  须为数字"; pause; } ;;
@@ -1470,7 +1616,8 @@ menu_diag() {
     printf '  %s              统计已暂停。可在菜单 1 -> 2 重新探测, 或编辑 %s 写死 IFACE%s\n' "$C_E" "$CFG" "$C_R"
   fi
   echo
-  printf '  %-14s %s\n' "SSH 端口" "${RSSH:-未知}/tcp   来源 sshd -T   限速强制豁免"
+  printf '  %-14s %s\n' "SSH 豁免端口" "${RSSH_LIST:-${RSSH:-未知}}   多源汇总, 限速强制豁免"
+  printf '  %-14s %s\n' "" "来源: sshd -T / sshd_config(.d) / ss 监听 / socket / 当前会话"
   printf '  %-14s %s\n' "nftables" "$(nft --version 2>/dev/null | head -1 || echo 未安装)"
   printf '  %-14s %s\n' "计数表" "$(nft list table inet "${NFT_TABLE}" >/dev/null 2>&1 && echo "inet ${NFT_TABLE} 已建立" || echo 未建立)"
   printf '  %-14s %s\n' "现有其他表" "$(nft list tables 2>/dev/null | grep -vc "${NFT_TABLE}") 张   互不干扰"
@@ -1513,7 +1660,7 @@ menu_service() {
          else echo "  须为 1-1440 之间的数字"; pause; fi ;;
       3) systemctl restart trafmgr-collect.timer 2>/dev/null && { audit "重启采集服务"; echo "  已重启"; }; pause ;;
       4) systemctl stop trafmgr-collect.timer 2>/dev/null && { audit "停止采集服务"; echo "  已停止"; }; pause ;;
-      5) nft_build && echo "  已重建"; pause ;;
+      5) nft_rebuild_safe && echo "  已重建"; pause ;;
       0|"") return ;;
       *) echo "  无效选择"; pause ;;
     esac
@@ -1573,7 +1720,7 @@ show_probe() {
     [[ $v == lo || $v == "$ifc" ]] && continue
     is_virtual_if "$v" && printf '    %-13s %s\n' "" "已排除虚拟接口 $v"
   done
-  printf '    SSH 端口      %s/tcp   限速将强制豁免\n' "$ssh"
+  printf '    SSH 豁免端口  %s   多源汇总, 限速将强制豁免\n' "$(detect_ssh_ports)"
   printf '    nftables      %s   现有 %s 张表, 将新建独立表, 互不干扰\n' \
     "$(nft --version 2>/dev/null | awk '{print $2}')" "$(nft list tables 2>/dev/null | grep -c .)"
   printf '    监听端口      发现 %s 个 (已跳过仅监听回环的)\n' "$nlisten"
@@ -1607,7 +1754,7 @@ do_install() {
   fi
 
   if [[ $auto == 1 ]]; then
-    echo "trafmgr: 探测 iface=$pif ip=$(detect_pubip "$pif") ssh=$(detect_ssh_port)"
+    echo "trafmgr: 探测 iface=$pif ip=$(detect_pubip "$pif") ssh=$(detect_ssh_ports)"
     echo "trafmgr: 配置 reset_day=$RESET_DAY quota=none basis=$QUOTA_BASIS interval=${COLLECT_INTERVAL}min"
     echo "trafmgr: 限制 host=off port=off"
   else
@@ -1775,11 +1922,11 @@ menu_deploy() {
     echo "    0)  返回"
     printf '\n  回车返回\n  请选择: '; read -r c
     case ${c:-0} in
-      1) install_wizard; confirm "确认应用" && { cfg_save; audit "配置向导重新应用"; cfg_load; nft_build; install_units; echo "  已应用"; }; pause ;;
+      1) install_wizard; confirm "确认应用" && { cfg_save; audit "配置向导重新应用"; cfg_load; nft_rebuild_safe; install_units; echo "  已应用"; }; pause ;;
       2) local oi=${RIFACE:-无} os=${RSSH:-无}
          cfg_load
          audit "重新探测: 网卡 $oi -> ${RIFACE:-未找到}   SSH $os -> ${RSSH:-未知}"
-         if require_iface; then do_discover; nft_build; echo "  已重新探测并应用, 网卡=$RIFACE"
+         if require_iface; then do_discover; nft_rebuild_safe; echo "  已重新探测并应用, 网卡=$RIFACE"
          else echo "  探测失败: ${IFACE_ERR:-未找到物理网卡}"; fi; pause ;;
       3) echo; sed 's/^/  /' "$CFG"; pause ;;
       4) echo; echo "  以下为可批量下发的配置 (已移除本机特有项):"; echo
@@ -1849,6 +1996,7 @@ do_status() {
   printf 'quota=%s basis=%s used=%s pct=%s\n' "${QUOTA:-0}" "${QUOTA_BASIS:-total}" "$used" \
     "$( (( ${QUOTA:-0} > 0 )) && pct_str "$used" "$QUOTA" || echo n/a )"
   printf 'enforce_host=%s enforce_port=%s limited=%s\n' "${ENFORCE_HOST:-0}" "${ENFORCE_PORT:-0}" "$( [[ -f $ENF_STATE ]] && echo yes || echo no )"
+  printf 'ssh_exempt=%s\n' "${RSSH_LIST:-$RSSH}"
   printf 'iface_ok=%s\n' "$( require_iface && echo yes || echo "no:${IFACE_ERR:-unknown}" )"
   printf 'human: 本期 上传 %s 下载 %s 合计 %s | 累计 %s\n' \
     "$(fmt_bytes "$u")" "$(fmt_bytes "$d")" "$(fmt_bytes "$((u+d))")" "$(fmt_bytes "$((lu+ld))")"
