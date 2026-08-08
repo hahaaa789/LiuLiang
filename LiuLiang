@@ -8,7 +8,7 @@
 #   4) 全量明文日志, 变更前后值均记录
 set -uo pipefail
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 REPO_RAW="${TRAFMGR_REPO:-https://raw.githubusercontent.com/hahaaa789/LiuLiang/main/LiuLiang}"
 
 # ---------------------------------------------------------------- 路径
@@ -346,9 +346,16 @@ cfg_read() {
   case $QUOTA_BASIS in up|down|total|max) ;; *) QUOTA_BASIS=total ;; esac
   case $PQUOTA_BASIS in up|down|total|max) ;; *) PQUOTA_BASIS=total ;; esac
   case $LOG_LEVEL in DEBUG|INFO|WARN|ERROR) ;; *) LOG_LEVEL=INFO ;; esac
-  local b
-  for b in AUTO_DISCOVER COUNT_FORWARD ENFORCE_HOST ENFORCE_PORT RESET_CLEAR_LIMITS; do
-    [[ $(eval "printf '%s' \"\$$b\"") =~ ^[01]$ ]] || printf -v "$b" '%s' 0
+  # 布尔项非法时回落到"各自的出厂默认", 不能一律归 0
+  # 尤其 RESET_CLEAR_LIMITS 归 0 会导致超额限速永久卡死
+  local b bd cur
+  for b in AUTO_DISCOVER:1 COUNT_FORWARD:1 ENFORCE_HOST:0 ENFORCE_PORT:0 RESET_CLEAR_LIMITS:1; do
+    bd=${b#*:}; b=${b%%:*}
+    cur=$(eval "printf '%s' \"\${$b:-}\"")
+    if [[ ! $cur =~ ^[01]$ ]]; then
+      [[ -n $cur ]] && logw "配置项 $b 值非法 [$cur], 已回落默认 $bd"
+      printf -v "$b" '%s' "$bd"
+    fi
   done
 }
 cfg_load() {
@@ -523,6 +530,7 @@ nft_build() {
     echo "delete table inet $t"
     echo "table inet $t {"
     echo "  chain local_in  { type filter hook input       priority -150; policy accept;"
+    echo "    iif lo return"      # 回环流量不消耗网卡带宽, 不计入端口统计
     while IFS=$'\t' read -r _k proto port kind note src first state last; do
       [[ -z ${_k:-} || ${_k} == \#* ]] && continue
       [[ ${state:-live} == gone ]] && continue
@@ -531,6 +539,7 @@ nft_build() {
     done < <(cat "$PORTS" 2>/dev/null)
     echo "  }"
     echo "  chain local_out { type filter hook output      priority -150; policy accept;"
+    echo "    oif lo return"
     while IFS=$'\t' read -r _k proto port kind note src first state last; do
       [[ -z ${_k:-} || ${_k} == \#* ]] && continue
       [[ ${state:-live} == gone ]] && continue
@@ -540,6 +549,7 @@ nft_build() {
     echo "  }"
     if [[ ${COUNT_FORWARD:-1} == 1 ]]; then
       echo "  chain fwd_in    { type filter hook prerouting  priority -300; policy accept;"
+      echo "    iif lo return"
       while IFS=$'\t' read -r _k proto port kind note src first state last; do
         [[ -z ${_k:-} || ${_k} == \#* ]] && continue
         [[ ${state:-live} == gone ]] && continue
@@ -548,6 +558,7 @@ nft_build() {
       done < <(cat "$PORTS" 2>/dev/null)
       echo "  }"
       echo "  chain fwd_out   { type filter hook postrouting priority 300; policy accept;"
+      echo "    oif lo return"
       while IFS=$'\t' read -r _k proto port kind note src first state last; do
         [[ -z ${_k:-} || ${_k} == \#* ]] && continue
         [[ ${state:-live} == gone ]] && continue
@@ -701,9 +712,11 @@ port_gc() {
   return 0
 }
 
+# $1=force: 传 force 时忽略 AUTO_DISCOVER 开关 (供菜单"立即重新扫描"使用)
+# 返回: 0=有变化  1=无变化  2=被开关跳过
 do_discover() {
-  local changed=0 proto port svc kind tgt k
-  [[ ${AUTO_DISCOVER:-1} == 1 ]] || return 1
+  local force=${1:-} changed=0 proto port svc kind tgt k
+  if [[ $force != force && ${AUTO_DISCOVER:-1} != 1 ]]; then return 2; fi
   local seen; seen=$(mktemp)
   while IFS=$'\t' read -r proto port svc; do
     [[ -z ${proto:-} ]] && continue
@@ -732,6 +745,8 @@ do_discover() {
   port_gc
   return $(( changed == 1 ? 0 : 1 ))
 }
+# 采集内部调用: 只在开关打开时扫描
+discover_if_enabled() { do_discover; local rc=$?; (( rc == 2 )) && return 1; return $rc; }
 
 # ---------------------------------------------------------------- 采集
 COLLECT_LOCK=""
@@ -793,7 +808,7 @@ do_collect() {
 
   # 端口发现: 变化只影响下一轮的表结构, 不丢当前计数
   local changed=0
-  do_discover && changed=1
+  discover_if_enabled && changed=1
   local newfp oldfp
   newfp=$(ports_fingerprint); oldfp=$(cat "$STATE_DIR/ports.fp" 2>/dev/null || echo "")
   local rebuilt=0
@@ -851,6 +866,13 @@ pbasis_name() {
 
 # ---------------------------------------------------------------- 限速 (nft limit)
 LIMIT_TABLE_SUFFIX="_lim"
+# 查询端口在监控清单中的类型: local / fwd / redir / 未知(默认按 local+fwd 双挂)
+port_kind_of() {
+  local k=$1 kd
+  kd=$(tsv_get "$k" "$PORTS" | cut -f4)
+  case ${kd:-} in local|fwd|redir) printf '%s' "$kd" ;; *) printf 'unknown' ;; esac
+}
+
 nft_limit_build() {
   local t="${NFT_TABLE:-$NFT_TABLE_DEFAULT}$LIMIT_TABLE_SUFFIX"
   nft_ok || return 1
@@ -864,7 +886,10 @@ nft_limit_build() {
     echo "table inet $t"
     echo "delete table inet $t"
     echo "table inet $t {"
+
+    # ---- 本机服务限速: 走 input / output ----
     echo "  chain lim_out { type filter hook output priority 100; policy accept;"
+    echo "    oif lo return"
     local sp
     for sp in ${RSSH_LIST:-$RSSH}; do
       echo "    tcp sport $sp accept"
@@ -873,11 +898,14 @@ nft_limit_build() {
     while IFS=$'\t' read -r key proto port dirn rate st src; do
       [[ -z ${key:-} || ${st:-} != on ]] && continue
       [[ $dirn == out || $dirn == both ]] || continue
+      local kd; kd=$(port_kind_of "$(pkey "$proto" "$port")")
+      [[ $kd == local || $kd == unknown ]] || continue
       local kbs; kbs=$(parse_rate_kbs "$rate"); [[ $kbs == ERR ]] && continue
       echo "    $proto sport $port limit rate over $kbs kbytes/second burst 32 kbytes drop"
     done < <(cat "$LIMITS" 2>/dev/null)
     echo "  }"
     echo "  chain lim_in { type filter hook input priority 100; policy accept;"
+    echo "    iif lo return"
     for sp in ${RSSH_LIST:-$RSSH}; do
       echo "    tcp dport $sp accept"
       echo "    tcp sport $sp accept"
@@ -885,8 +913,36 @@ nft_limit_build() {
     while IFS=$'\t' read -r key proto port dirn rate st src; do
       [[ -z ${key:-} || ${st:-} != on ]] && continue
       [[ $dirn == in || $dirn == both ]] || continue
+      local kd; kd=$(port_kind_of "$(pkey "$proto" "$port")")
+      [[ $kd == local || $kd == unknown ]] || continue
       local kbs; kbs=$(parse_rate_kbs "$rate"); [[ $kbs == ERR ]] && continue
       echo "    $proto dport $port limit rate over $kbs kbytes/second burst 32 kbytes drop"
+    done < <(cat "$LIMITS" 2>/dev/null)
+    echo "  }"
+
+    # ---- 转发/跳跃端口限速: 必须走 forward, 转发包不经过 input/output ----
+    # 入方向 = 客户端 -> 本机(公网端口), 用 ct original proto-dst 还原 NAT 前端口
+    # 出方向 = 本机 -> 客户端(回程), 用 ct original proto-dst 同样匹配同一条连接
+    echo "  chain lim_fwd { type filter hook forward priority 100; policy accept;"
+    echo "    iif lo return"
+    echo "    oif lo return"
+    for sp in ${RSSH_LIST:-$RSSH}; do
+      echo "    tcp dport $sp accept"
+      echo "    tcp sport $sp accept"
+    done
+    while IFS=$'\t' read -r key proto port dirn rate st src; do
+      [[ -z ${key:-} || ${st:-} != on ]] && continue
+      local kd; kd=$(port_kind_of "$(pkey "$proto" "$port")")
+      [[ $kd == fwd || $kd == redir || $kd == unknown ]] || continue
+      local kbs; kbs=$(parse_rate_kbs "$rate"); [[ $kbs == ERR ]] && continue
+      # 原方向: 目的端口即公网端口 (DNAT 前, forward 链看到的已是 DNAT 后, 故用 ct original)
+      if [[ $dirn == in || $dirn == both ]]; then
+        echo "    meta l4proto $proto ct original proto-dst $port limit rate over $kbs kbytes/second burst 32 kbytes drop"
+      fi
+      # 回方向: 同一连接的回程包, ct original proto-dst 仍是公网端口
+      if [[ $dirn == out || $dirn == both ]]; then
+        echo "    meta l4proto $proto ct original proto-dst $port ct direction reply limit rate over $kbs kbytes/second burst 32 kbytes drop"
+      fi
     done < <(cat "$LIMITS" 2>/dev/null)
     echo "  }"
     echo "}"
@@ -977,9 +1033,16 @@ table inet $t
 delete table inet $t
 table inet $t {
   chain enf_out { type filter hook output priority 110; policy accept;
+    oif lo return
 ${exo}    limit rate over $kbs kbytes/second burst 64 kbytes drop
   }
   chain enf_in { type filter hook input priority 110; policy accept;
+    iif lo return
+${exi}    limit rate over $kbs kbytes/second burst 64 kbytes drop
+  }
+  chain enf_fwd { type filter hook forward priority 110; policy accept;
+    iif lo return
+    oif lo return
 ${exi}    limit rate over $kbs kbytes/second burst 64 kbytes drop
   }
 }
@@ -1332,8 +1395,8 @@ menu_enforce() {
     title "超额动作"
     printf '    A. 整机限制                        %s\n' "$( [[ ${ENFORCE_HOST:-0} == 1 ]] && printf '%s开启%s' "$C_G" "$C_R" || echo 关闭 )"
     printf '       触发   本期用量(按%s) >= %s%% 配额 %s\n' "$(basis_name)" "${ENFORCE_HOST_AT:-100}" "$( (( ${QUOTA:-0} > 0 )) && fmt_bytes "$QUOTA" || echo 未设置 )"
-    printf '       动作   整机限速 %s  出站 + 入站\n' "${ENFORCE_HOST_RATE:-1M}"
-    printf '       豁免   SSH %s (tcp) 永不限速   [强制]\n' "${RSSH_LIST:-$RSSH}"
+    printf '       动作   整机限速 %s  出站 + 入站 + 转发\n' "${ENFORCE_HOST_RATE:-1M}"
+    printf '       豁免   SSH %s (tcp) 与回环 lo 永不限速   [强制]\n' "${RSSH_LIST:-$RSSH}"
     echo
     printf '    B. 单端口限制                      %s\n' "$( [[ ${ENFORCE_PORT:-0} == 1 ]] && printf '%s开启%s' "$C_G" "$C_R" || echo 关闭 )"
     printf '       动作   超配额端口自动限速至 %s (双向)\n' "${ENFORCE_PORT_RATE:-1M}"
@@ -1371,7 +1434,7 @@ menu_enforce() {
            cfg_set ENFORCE_HOST 0; enforce_clear "用户关闭整机限制"; echo "  已关闭"
          else
            (( ${QUOTA:-0} == 0 )) && { echo "  未设置配额, 无法开启整机限制, 请先在菜单 2 设置"; pause; continue; }
-           confirm_danger "开启后, 用量达阈值将自动限速全机 (SSH ${RSSH_LIST:-$RSSH} 除外)" && { cfg_set ENFORCE_HOST 1; echo "  已开启"; }
+           confirm_danger "开启后, 用量达阈值将自动限速全机 (SSH ${RSSH_LIST:-$RSSH} 与 lo 除外)" && { cfg_set ENFORCE_HOST 1; echo "  已开启"; }
          fi; pause ;;
       2) ask "阈值百分比 (如 100 表示用满配额时触发)" "${ENFORCE_HOST_AT:-100}"
          if [[ $REPLY_VAL =~ ^[0-9]+$ ]] && (( REPLY_VAL >= 1 && REPLY_VAL <= 500 )); then
@@ -1382,7 +1445,7 @@ menu_enforce() {
            cfg_set ENFORCE_PORT 0; enforce_clear "用户关闭端口限制"; echo "  已关闭"
          else
            (( $(nlines "$PQUOTA") == 0 )) && { echo "  尚未设置任何端口配额, 请先用选项 6 添加"; pause; continue; }
-           confirm_danger "开启后, 超配额端口将自动限速 (SSH ${RSSH_LIST:-$RSSH} 除外)" && { cfg_set ENFORCE_PORT 1; echo "  已开启"; }
+           confirm_danger "开启后, 超配额端口将自动限速 (SSH ${RSSH_LIST:-$RSSH} 与 lo 除外)" && { cfg_set ENFORCE_PORT 1; echo "  已开启"; }
          fi; pause ;;
       5) ask_rate "端口限速速率 (如 1M / 500K)" "${ENFORCE_PORT_RATE:-1M}" && cfg_set ENFORCE_PORT_RATE "$RATE_VAL" ;;
       6) menu_pquota ;;
@@ -1451,7 +1514,8 @@ menu_pquota() {
 menu_limits() {
   while :; do
     cfg_load
-    title "限速规则     方式 nftables limit, 不改动网卡 qdisc"
+    title "限速规则     nftables limit, 不改动网卡 qdisc"
+    printf '  %s本机端口走 input/output 链; 转发端口走 forward 链 (ct original proto-dst)%s\n' "$C_D" "$C_R"
     hr
     printf '  %-22s %-10s %-6s %10s %8s  %s\n' 规则 端口 方向 速率 状态 来源
     local i=0
@@ -1478,7 +1542,9 @@ menu_limits() {
          echo "    1) 出站   2) 入站   3) 双向"; ask "方向" "1"
          local dn; case $REPLY_VAL in 2) dn=in;; 3) dn=both;; *) dn=out;; esac
          ask_rate "速率 (如 1M / 100M / 500K)" "1M" || continue
+         local kd; kd=$(port_kind_of "$(pkey "$pr" "$PORT_VAL")")
          echo "  预览: $pr 端口 $PORT_VAL 方向 $dn 限速 $RATE_VAL ($(parse_rate_kbs "$RATE_VAL") kbytes/second)"
+         echo "        端口类型 $kd -> 规则将挂在 $( [[ $kd == fwd || $kd == redir ]] && echo "forward 链" || echo "input/output 链" )"
          confirm "确认添加" && { limit_add "$pr" "$PORT_VAL" "$dn" "$RATE_VAL" manual && echo "  已添加并生效"; }; pause ;;
       2) ask "输入要删除的规则名 (第一列)" ""; [[ -z $REPLY_VAL ]] && continue
          limit_del "$REPLY_VAL" && echo "  已删除" || echo "  未找到"; pause ;;
@@ -1538,7 +1604,23 @@ menu_portlist() {
       2) ask "输入要删除的端口 (格式 端口/协议, 如 8443/tcp)" ""; [[ -z $REPLY_VAL ]] && continue
          if port_del "$REPLY_VAL"; then nft_rebuild_safe; echo "  已删除"; else echo "  未找到"; fi; pause ;;
       3) [[ ${AUTO_DISCOVER:-1} == 1 ]] && cfg_set AUTO_DISCOVER 0 || cfg_set AUTO_DISCOVER 1 ;;
-      4) do_discover; nft_rebuild_safe; echo "  扫描完成"; pause ;;
+      4) local before after rc
+         before=$(nlines "$PORTS")
+         if [[ ${AUTO_DISCOVER:-1} != 1 ]]; then
+           echo "  提示: 自动发现当前为关闭状态, 本次为手动强制扫描"
+         fi
+         do_discover force; rc=$?
+         after=$(nlines "$PORTS")
+         if (( rc == 0 )); then
+           if nft_rebuild_safe; then
+             echo "  扫描完成, 端口清单有变化 ($before -> $after 个), 计数表已重建"
+           else
+             echo "  扫描完成但计数表重建失败, 详见菜单 9 日志"
+           fi
+         else
+           echo "  扫描完成, 端口清单无变化 (共 $after 个), 未重建计数表"
+         fi
+         pause ;;
       5) local m=0
          while IFS=$'\t' read -r k proto port kind note src first state last; do
            [[ -z ${k:-} ]] && continue
@@ -1630,6 +1712,8 @@ menu_diag() {
   [[ -n ${cmax:-} ]] && printf '  %-14s %s\n' "conntrack" "$ccur / $cmax$( (( ${cmax:-1} > 0 && ${ccur:-0} * 100 / cmax > 70 )) && printf '   %s使用率偏高%s' "$C_Y" "$C_R" )"
   printf '  %-14s %s\n' "awk 实现" "$(awk -W version 2>&1 | head -1 || awk --version 2>/dev/null | head -1)"
   printf '  %-14s %s\n' "数值运算" "全部使用 bash 64 位整数, 不经 awk"
+  printf '  %-14s %s\n' "回环豁免" "计数与限速均跳过 lo, 本地互访不计流量/不限速"
+  printf '  %-14s %s\n' "转发限速" "转发端口走 forward 链 (ct original proto-dst), 本机端口走 input/output"
   hr
   pause
 }
@@ -1660,7 +1744,7 @@ menu_service() {
          else echo "  须为 1-1440 之间的数字"; pause; fi ;;
       3) systemctl restart trafmgr-collect.timer 2>/dev/null && { audit "重启采集服务"; echo "  已重启"; }; pause ;;
       4) systemctl stop trafmgr-collect.timer 2>/dev/null && { audit "停止采集服务"; echo "  已停止"; }; pause ;;
-      5) nft_rebuild_safe && echo "  已重建"; pause ;;
+      5) if nft_rebuild_safe; then echo "  已重建"; else echo "  重建失败, 详见菜单 9 日志"; fi; pause ;;
       0|"") return ;;
       *) echo "  无效选择"; pause ;;
     esac
@@ -1731,6 +1815,65 @@ show_probe() {
   PROBE_IF=$ifc
 }
 
+# 校验候选文件确实是一份完整可用的 trafmgr, 而非空文件/HTML 错误页/截断内容
+_is_valid_self() {
+  local f=$1
+  [[ -s $f ]] || return 1
+  (( $(wc -c < "$f") > 10000 )) || return 1        # 完整脚本远大于 10KB
+  grep -q '^VERSION=' "$f" || return 1
+  grep -q '^main "\$@"' "$f" || return 1           # 必须有入口调用, 确保未被截断
+  bash -n "$f" 2>/dev/null || return 1
+  return 0
+}
+
+# 主程序落盘
+# 关键: bash <(curl ...) 时 BASH_SOURCE 是 /dev/fd/NN, 这是个"已被消费的流",
+#       cat 它只能读到 bash 尚未解析的剩余部分, 复制出来必然是残缺的。
+#       cat | bash 时 BASH_SOURCE 甚至为空。
+#       因此只有"真实普通文件"才能直接复制, 其余一律从仓库重新下载。
+install_self() {
+  local src=${BASH_SOURCE[0]:-}
+
+  # 已经就位, 无需处理
+  if [[ -n $src && -f $src ]] && [[ $src -ef $BIN_PATH ]] 2>/dev/null; then
+    return 0
+  fi
+
+  # 方式1 源是真实普通文件 (curl -o 后再 bash 执行 / 本地已安装后调用)
+  if [[ -n $src && -f $src && -r $src ]]; then
+    local tmp; tmp=$(mktemp)
+    if cat "$src" > "$tmp" 2>/dev/null && _is_valid_self "$tmp"; then
+      mkdir -p "$(dirname "$BIN_PATH")"
+      mv -f "$tmp" "$BIN_PATH" && chmod 755 "$BIN_PATH"
+      audit "主程序安装至 $BIN_PATH (来源 $src)"
+      return 0
+    fi
+    rm -f "$tmp"
+  fi
+
+  # 方式2 从仓库下载 (进程替换 / 管道执行时的唯一可靠途径)
+  local tmp; tmp=$(mktemp)
+  logi "当前为流式执行 (源=${src:-stdin}), 从仓库下载主程序以确保完整"
+  if { curl -fsSL -m 60 "$REPO_RAW" -o "$tmp" 2>/dev/null || wget -qO "$tmp" "$REPO_RAW" 2>/dev/null; } \
+     && _is_valid_self "$tmp"; then
+    mkdir -p "$(dirname "$BIN_PATH")"
+    mv -f "$tmp" "$BIN_PATH" && chmod 755 "$BIN_PATH"
+    audit "主程序安装至 $BIN_PATH (来源 $REPO_RAW)"
+    return 0
+  fi
+  rm -f "$tmp"
+
+  loge "主程序落盘失败: 源=${src:-stdin} 仓库=$REPO_RAW"
+  echo
+  echo "  无法将主程序写入 $BIN_PATH"
+  echo "  原因: 流式执行无法自我复制, 且从仓库下载失败 (网络或地址问题)"
+  echo
+  echo "  请改用先下载再执行的方式:"
+  echo "    curl -fsSL $REPO_RAW -o /tmp/trafmgr.sh"
+  echo "    bash /tmp/trafmgr.sh"
+  return 1
+}
+
 do_install() {
   local auto=${1:-0}
   LOG_TAG=install
@@ -1740,16 +1883,35 @@ do_install() {
   touch "$PORTS" "$LIMITS" "$PQUOTA" "$CYCLE" "$LIFE" "$SNAP"
 
   cfg_defaults
+  cfg_read                 # 先吃掉已存在的配置, 让用户手写的 IFACE 能救场
   audit "===== 安装开始 v$VERSION  模式=$( [[ $auto == 1 ]] && echo 全自动 || echo 交互 ) ====="
   audit "安装前环境: 内核=$(uname -r) 发行版=$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-未知}") nft=$(nft --version 2>/dev/null | awk '{print $2}')"
   audit "安装前 nft 表: $(nft list tables 2>/dev/null | tr '\n' ';' | sed 's/;$//')"
 
-  local pif; pif=$(detect_iface)
+  # 网卡确定: 手写优先, 否则自动探测
+  local pif
+  if [[ ${IFACE:-auto} != auto ]]; then
+    if [[ -d $SYSNET/$IFACE ]]; then
+      pif=$IFACE; audit "采用配置文件指定网卡 $pif (跳过自动探测)"
+    else
+      loge "配置指定的网卡 $IFACE 不存在"
+      echo "  错误: 配置文件里的 IFACE=$IFACE 不存在"
+      echo "  可用接口: $(ls "$SYSNET" 2>/dev/null | tr '\n' ' ')"
+      echo "  请修改 $CFG 后重试"
+      exit 1
+    fi
+  else
+    pif=$(detect_iface)
+  fi
   if [[ -z $pif ]]; then
     loge "安装中止: 未探测到任何物理网卡"
     echo "  错误: 未找到物理网卡 (已排除虚拟接口)"
     echo "  可用接口: $(ls "$SYSNET" 2>/dev/null | tr '\n' ' ')"
-    echo "  如确需指定, 请先创建 $CFG 并写入 IFACE=网卡名"
+    echo
+    echo "  解决办法: 手动指定网卡后重新安装"
+    echo "    mkdir -p $CFG_DIR"
+    echo "    echo 'IFACE=你的网卡名' > $CFG"
+    echo "    然后重新运行安装命令"
     exit 1
   fi
 
@@ -1788,12 +1950,10 @@ do_install() {
   audit "配置写入: IFACE=$IFACE RESET_DAY=$RESET_DAY QUOTA=$QUOTA BASIS=$QUOTA_BASIS INTERVAL=$COLLECT_INTERVAL AUTO_DISCOVER=$AUTO_DISCOVER ENFORCE_HOST=$ENFORCE_HOST ENFORCE_PORT=$ENFORCE_PORT"
   cfg_load
 
-  if [[ -f ${BASH_SOURCE[0]} && ${BASH_SOURCE[0]} != "$BIN_PATH" ]]; then
-    cp -f "${BASH_SOURCE[0]}" "$BIN_PATH" 2>/dev/null && chmod 755 "$BIN_PATH" && audit "主程序安装至 $BIN_PATH"
-  fi
+  install_self || { echo "  错误: 主程序落盘失败, 采集服务将无法运行"; exit 1; }
   [[ -f $STAMP ]] || { date +%s > "$STAMP"; audit "记录安装时间 $(date '+%F %T')"; }
 
-  do_discover
+  do_discover force
   audit "端口注册完成, 共 $(nlines "$PORTS") 个"
   nft_build
   install_units
@@ -1884,9 +2044,10 @@ do_update() {
   local tmp; tmp=$(mktemp)
   echo "  正在下载最新版本..."
   if curl -fsSL -m 30 "$REPO_RAW" -o "$tmp" 2>/dev/null; then
-    if bash -n "$tmp" 2>/dev/null && grep -q '^VERSION=' "$tmp"; then
+    if _is_valid_self "$tmp"; then
       local ov nv
       ov=$VERSION; nv=$(awk -F'"' '/^VERSION=/{print $2; exit}' "$tmp")
+      mkdir -p "$(dirname "$BIN_PATH")"
       cp -f "$tmp" "$BIN_PATH" && chmod 755 "$BIN_PATH"
       audit_change "脚本版本" "$ov" "${nv:-未知}" "配置与数据保留"
       echo "  已更新至 ${nv:-未知}, 配置与统计数据均保留"
@@ -1926,7 +2087,10 @@ menu_deploy() {
       2) local oi=${RIFACE:-无} os=${RSSH:-无}
          cfg_load
          audit "重新探测: 网卡 $oi -> ${RIFACE:-未找到}   SSH $os -> ${RSSH:-未知}"
-         if require_iface; then do_discover; nft_rebuild_safe; echo "  已重新探测并应用, 网卡=$RIFACE"
+         if require_iface; then
+           do_discover force
+           if nft_rebuild_safe; then echo "  已重新探测并应用, 网卡=$RIFACE  SSH豁免=${RSSH_LIST:-$RSSH}"
+           else echo "  探测完成但计数表重建失败, 详见菜单 9 日志"; fi
          else echo "  探测失败: ${IFACE_ERR:-未找到物理网卡}"; fi; pause ;;
       3) echo; sed 's/^/  /' "$CFG"; pause ;;
       4) echo; echo "  以下为可批量下发的配置 (已移除本机特有项):"; echo
