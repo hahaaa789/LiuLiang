@@ -1855,7 +1855,35 @@ enforce_check() {
 # ---------------------------------------------------------------- 显示
 C_R=$'\033[0m'; C_B=$'\033[1m'; C_D=$'\033[2m'
 C_G=$'\033[32m'; C_Y=$'\033[33m'; C_E=$'\033[31m'
-[[ -t 1 ]] || { C_R=; C_B=; C_D=; C_G=; C_Y=; C_E=; }
+C_M=$'\033[35m'       # 洋红: 流量数值 (上传/下载/合计/剩余/配额)
+C_N=$'\033[36m'       # 青:   日期 / 天数 / 计数等一般数字
+C_W=$'\033[1;37m'     # 亮白: 累计用量
+[[ -t 1 ]] || { C_R=; C_B=; C_D=; C_G=; C_Y=; C_E=; C_M=; C_N=; C_W=; }
+# 着色包装: 先算好文本再包裹转义码, 避免 ANSI 计入显示宽度
+cm() { printf '%s%s%s' "$C_M" "$1" "$C_R"; }   # 流量值
+cn() { printf '%s%s%s' "$C_N" "$1" "$C_R"; }   # 一般数字
+cw() { printf '%s%s%s' "$C_W" "$1" "$C_R"; }   # 累计值
+# 配额水位配色: <70% 绿, 70-89% 黄, >=90% 红。入参为千分比 (pct 的返回值)
+quota_color() {
+  local pm=${1:-0}
+  if   (( pm >= 900 )); then printf '%s' "$C_E"
+  elif (( pm >= 700 )); then printf '%s' "$C_Y"
+  else printf '%s' "$C_G"; fi
+}
+# 配额计算方式的完整描述 (菜单需要区分单向/双向, 比 basis_name 更明确)
+basis_desc() {
+  case ${QUOTA_BASIS:-total} in
+    up)   echo "单向(仅上传)" ;;
+    down) echo "单向(仅下载)" ;;
+    max)  echo "单向(取较大)" ;;
+    *)    echo "双向(上传+下载)" ;;
+  esac
+}
+# 今日用量: 取按日归档文件中当天那一行
+usage_today() {
+  local f="$DAILY_DIR/$(date +%Y-%m).tsv"
+  acc_get "$(date +%F)" "$f"
+}
 # 显示宽度: 按 UTF-8 首字节统计, 三字节字符 (CJK) 记 2 列
 dwidth() {
   local s=$1 b n2 n3 n4
@@ -1871,27 +1899,18 @@ hr(){ printf '  %s\n' "---------------------------------------------------------
 title(){ printf '\n  %s%s%s\n' "$C_B" "$1" "$C_R"; }
 
 show_header() {
-  local host lastrun ago st inst up
+  local host lastrun ago st inst
   host=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo localhost)
-  inst=$(cat "$STAMP" 2>/dev/null || echo 0); [[ $inst =~ ^[0-9]+$ ]] || inst=0
-  up=$(( $(date +%s) - inst )); (( inst == 0 )) && up=0
   lastrun=$(cat "$LASTRUN" 2>/dev/null || echo 0); [[ $lastrun =~ ^[0-9]+$ ]] || lastrun=0
-  if (( lastrun == 0 )); then st="${C_Y}尚未采集${C_R}"; ago="-"
+  if (( lastrun == 0 )); then st="${C_Y}尚未采集${C_R}"; ago=""
   else
     ago=$(( $(date +%s) - lastrun ))
     if (( ago > ${COLLECT_INTERVAL:-5} * 60 * 3 )); then st="${C_E}采集异常${C_R}"; else st="${C_G}采集正常${C_R}"; fi
-    ago="$(( ago / 60 )) 分钟前"
+    ago=" $(cn "$(( ago / 60 ))") 分钟前"
   fi
   local ifshow=${RIFACE:-}
   [[ -z $ifshow ]] && ifshow="${C_E}网卡未确定${C_R}"
-  printf '\n  %strafmgr%s  v%s   %s   %s  %s\n' "$C_B" "$C_R" "$VERSION" "$host" "$ifshow" "${RIP:-无IP}"
-  printf '  脚本已运行  %s %s  %s\n' "$(padr "$(fmt_dur "$up")" 28)" "$st" "$ago"
-}
-
-show_usage_block() {
-  local label=$1 u=$2 d=$3
-  local tot=$(( u + d ))
-  printf '  %s %s %s %s\n' "$(padr "$label" 12)" "$(padl "$(fmt_bytes "$u")" 14)" "$(padl "$(fmt_bytes "$d")" 14)" "$(padl "$(fmt_bytes "$tot")" 14)"
+  printf '  %s  %s  %s   %s%s\n' "$host" "$ifshow" "${RIP:-无IP}" "$st" "$ago"
 }
 
 # 预计用尽日期。avg 极小时 remain/avg 会溢出 date 的可表示范围, 屏幕上会冒出
@@ -1905,63 +1924,92 @@ eta_text() {
 }
 
 show_dashboard() {
-  local u d now sc se days total_days used q avg
+  local u d now sc se days used q avg pm
   read -r u d <<<"$(usage_cycle)"
   now=$(date +%s); read -r sc se <<<"$(cycle_range "${RESET_DAY:-1}" "$now")"
   days=$(( (now - sc) / 86400 + 1 )); (( days < 1 )) && days=1
-  total_days=$(( (se - sc) / 86400 ))
   used=$(basis_value "$u" "$d"); q=${QUOTA:-0}
   avg=$(( used / days ))
 
+  printf '\n  %strafmgr%s %sv%s%s\n' "$C_B" "$C_R" "$C_B" "$VERSION" "$C_R"
+  hr
   show_header
   if ! require_iface; then
     printf '  %s警告: %s  统计已暂停, 请在菜单 1 -> 2 重新探测%s\n' "$C_E" "${IFACE_ERR:-网卡不可用}" "$C_R"
   fi
-  hr
-  printf '  本期用量    每月 %s 号重置    %s ~ %s    第 %d/%d 天\n' \
-    "${RESET_DAY:-1}" "$(date -d "@$sc" +%m-%d)" "$(date -d "@$((se-86400))" +%m-%d)" "$days" "$total_days"
-  hr
-  printf '  %s %s %s %s\n' "$(padr "" 12)" "$(padl 上传 14)" "$(padl 下载 14)" "$(padl 合计 14)"
-  show_usage_block "流量" "$u" "$d"
+
+  # 周期与配额口径
+  printf '  每月 %s 号重置   本期: %s - %s   第 %s 天\n' \
+    "$(cn "${RESET_DAY:-1}")" \
+    "$(cn "$(date -d "@$sc" +%m.%d)")" "$(cn "$(date -d "@$((se-86400))" +%m.%d)")" \
+    "$(cn "$days")"
   if (( q > 0 )); then
-    printf '  %s %s   口径:%s\n' "$(padr 配额 12)" "$(padl "$(fmt_bytes "$q")" 44)" "$(basis_name)"
-    printf '  [%s]  %s\n' "$(bar "$used" "$q" 40)" "$(pct_str "$used" "$q")"
-    local remain=$(( q - used )); (( remain < 0 )) && remain=0
-    printf '  剩余 %s     日均 %s%s\n' "$(fmt_bytes "$remain")" "$(fmt_bytes "$avg")" "$(eta_text "$remain" "$avg" "$now")"
+    printf '  配额: %s   计算方式: %s\n' "$(cm "$(fmt_bytes "$q")")" "$(cm "$(basis_desc)")"
   else
-    printf '  %s %s\n' "$(padr 配额 12)" "$(padl 未设置 44)"
-    printf '  %s仅统计, 未启用任何限制%s   日均 %s\n' "$C_D" "$C_R" "$(fmt_bytes "$avg")"
+    printf '  配额: %s未设置%s   %s当前仅统计, 不做任何限制%s\n' "$C_Y" "$C_R" "$C_D" "$C_R"
   fi
-  hr
+
+  # 三个量各占一行
+  printf '  上传: %s\n' "$(cm "$(fmt_bytes "$u")")"
+  printf '  下载: %s\n' "$(cm "$(fmt_bytes "$d")")"
+  printf '  合计: %s\n' "$(cm "$(fmt_bytes "$((u+d))")")"
+
+  # 配额相关: 未设配额时整体隐藏, 不留空架子
+  local remain=0
+  if (( q > 0 )); then
+    remain=$(( q - used )); (( remain < 0 )) && remain=0
+    pm=$(pct "$used" "$q")
+    local qc; qc=$(quota_color "$pm")
+    printf '  剩余: %s\n' "$(cm "$(fmt_bytes "$remain")")"
+    printf '  已用 %s%s%s\n' "$qc" "$(pct_str "$used" "$q")" "$C_R"
+    printf '  [%s%s%s]\n' "$qc" "$(bar "$used" "$q" 46)" "$C_R"
+  fi
+
+  # 今日 / 日均 / 预计用尽
+  local tu td
+  read -r tu td <<<"$(usage_today)"
+  local eta=""
+  (( q > 0 )) && eta=$(eta_text "$remain" "$avg" "$now")
+  printf '  今日: %s   日均: %s%s\n' \
+    "$(cn "$(fmt_bytes "$((tu+td))")")" "$(cn "$(fmt_bytes "$avg")")" "$eta"
+
+  # 累计 + 跑量端口
   local lu ld inst
   read -r lu ld <<<"$(usage_life)"
   inst=$(cat "$STAMP" 2>/dev/null || echo 0)
-  printf '  累计用量    自 %s 安装以来\n' "$( (( inst > 0 )) && date -d "@$inst" +%F || echo 未知 )"
-  hr
-  printf '  %s %s %s %s\n' "$(padr "" 12)" "$(padl 上传 14)" "$(padl 下载 14)" "$(padl 合计 14)"
-  show_usage_block "流量" "$lu" "$ld"
-  hr
-  printf '  跑量 TOP3   %s\n' "$(top_ports 3)"
-  local nlim nq
+  printf '  自 %s 累计: %s\n' \
+    "$(cn "$( (( inst > 0 )) && date -d "@$inst" +%F || echo 未知 )")" \
+    "$(cw "$(fmt_bytes "$((lu+ld))")")"
+  printf '  跑量端口: %s\n' "$(top_ports 3)"
+
+  # 当前生效的设置
+  local nlim nq nenf
   nlim=$(awk -F'\t' '$6=="on"' "$LIMITS" 2>/dev/null | grep -c .); [[ $nlim =~ ^[0-9]+$ ]] || nlim=0
   nq=$(nlines "$PQUOTA")
-  printf '  超额动作    整机 %s      端口 %s (配额 %s 个)     限速规则 %s 条\n' \
-    "$( [[ ${ENFORCE_HOST:-0} == 1 ]] && echo 开启 || echo 关闭 )" \
-    "$( [[ ${ENFORCE_PORT:-0} == 1 ]] && echo 开启 || echo 关闭 )" "$nq" "$nlim"
+  nenf=$(awk -F'\t' -v t="$ENF_TAG" '$7==t' "$LIMITS" 2>/dev/null | grep -c .); [[ $nenf =~ ^[0-9]+$ ]] || nenf=0
+  local sw_h sw_p sw_a
+  # 超额限速属于"会丢包"的动作, 开启时用红色提示, 关闭时青色表示安全
+  if [[ ${ENFORCE_HOST:-0} == 1 ]]; then
+    sw_h="${C_E}开${C_R}(达$(cn "${ENFORCE_HOST_AT:-100}")%限$(cn "${ENFORCE_HOST_RATE:-1M}"))"
+  else sw_h="${C_N}关${C_R}"; fi
+  if [[ ${ENFORCE_PORT:-0} == 1 ]]; then
+    sw_p="${C_E}开${C_R}(限$(cn "${ENFORCE_PORT_RATE:-1M}"))"
+  else sw_p="${C_N}关${C_R}"; fi
+  [[ ${AUTO_DISCOVER:-1} == 1 ]] && sw_a="${C_G}开${C_R}" || sw_a="${C_D}关${C_R}"
+  printf '  超额限速（需手动开）: 整机 %s   端口 %s   端口配额 %s 个   限速 %s 条\n' \
+    "$sw_h" "$sw_p" "$(cn "$nq")" "$(cn "$nlim")"
   local nerr; nerr=$(grep -c 'ERROR' "$LOG" 2>/dev/null); [[ $nerr =~ ^[0-9]+$ ]] || nerr=0
-  printf '  运行日志    %s 行        异常 %s 条%s\n' \
-    "$(wc -l < "$LOG" 2>/dev/null || echo 0)" "$nerr" \
-    "$( (( nerr > 0 )) && printf '   %s见菜单 9%s' "$C_Y" "$C_R" )"
-  # 以实际表存在与否为准, 不只看状态文件
+  printf '  运行状态: 采集每 %s 分钟   自动发现 %s   日志 %s 行   异常 %s\n' \
+    "$(cn "${COLLECT_INTERVAL:-5}")" "$sw_a" "$(cn "$(wc -l < "$LOG" 2>/dev/null || echo 0)")" \
+    "$( (( nerr > 0 )) && printf '%s%s 条 (见菜单 9)%s' "$C_E" "$nerr" "$C_R" || printf '%s0%s' "$C_G" "$C_R" )"
+
+  # 仅在真正触发时才占行
   if enforce_host_active; then
-    printf '  %s超额限速生效中: %s%s\n' "$C_E" "$(cat "$ENF_STATE" 2>/dev/null || echo "整机限速表 $(enf_table) 存在")" "$C_R"
+    printf '  %s>> 整机超额限速生效中: %s%s\n' "$C_E" "$(cat "$ENF_STATE" 2>/dev/null || echo "表 $(enf_table) 存在")" "$C_R"
   elif [[ -f $ENF_STATE ]]; then
-    printf '  %s提示: 限速表已不存在, 残留状态文件将在下轮采集清理%s\n' "$C_D" "$C_R"
+    printf '  %s提示: 限速表已不存在, 残留状态将在下轮采集清理%s\n' "$C_D" "$C_R"
   fi
-  local nenf; nenf=$(awk -F'\t' -v t="$ENF_TAG" '$7==t' "$LIMITS" 2>/dev/null | grep -c .); [[ $nenf =~ ^[0-9]+$ ]] || nenf=0
-  (( nenf > 0 )) && printf '  %s端口超额限速生效中: %s 个%s\n' "$C_E" "$nenf" "$C_R"
-  hr
-  printf '  %s单位为十进制: 1KB=1000B, 1MB=1000KB, 1GB=1000MB, 1TB=1000GB%s\n' "$C_D" "$C_R"
+  (( nenf > 0 )) && printf '  %s>> 端口超额限速生效中: %s 个%s\n' "$C_E" "$nenf" "$C_R"
   hr
 }
 
@@ -3199,19 +3247,19 @@ main_menu() {
     cfg_load
     clear 2>/dev/null
     show_dashboard
-    echo
-    echo "    1)  安装部署 / 重新配置"
-    echo "    2)  配额与计费周期"
-    echo "    3)  超额动作"
-    echo "    4)  限速规则"
-    echo "    5)  端口流量明细"
-    echo "    6)  端口监控清单"
-    echo "    7)  采集服务状态"
-    echo "    8)  系统诊断"
-    echo "    9)  运行日志"
-    echo "    h)  历史用量"
-    echo "    0)  退出"
-    printf '\n  回车 = 刷新\n  请选择: '
+    printf '\n\n\n'
+    printf '  %s1)%s 安装部署 / 重新配置\n' "$C_B" "$C_R"
+    printf '  %s2)%s 配额与计费周期\n'      "$C_B" "$C_R"
+    printf '  %s3)%s 超额动作\n'            "$C_B" "$C_R"
+    printf '  %s4)%s 限速规则\n'            "$C_B" "$C_R"
+    printf '  %s5)%s 端口流量明细\n'        "$C_B" "$C_R"
+    printf '  %s6)%s 端口监控清单\n'        "$C_B" "$C_R"
+    printf '  %s7)%s 采集服务状态\n'        "$C_B" "$C_R"
+    printf '  %s8)%s 系统诊断\n'            "$C_B" "$C_R"
+    printf '  %s9)%s 运行日志\n'            "$C_B" "$C_R"
+    printf '  %sh)%s 历史用量\n'            "$C_B" "$C_R"
+    printf '  %s0)%s 退出\n'                "$C_B" "$C_R"
+    printf '\n  回车 = 刷新   请选择: '
     if ! read -r c; then echo; echo "  输入已结束, 退出。"; exit 0; fi
     case ${c:-refresh} in
       1) menu_deploy ;;
