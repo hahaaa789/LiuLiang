@@ -4,8 +4,9 @@
 #
 # 设计要点:
 #   1) 所有数值运算走 bash 64 位整数, awk 只处理文本 (规避 mawk 32 位截断)
-#   2) 单位一律十进制: 1KB=1000B, 1MB=1000KB, 1GB=1000MB, 1TB=1000GB
+#   2) 输入与存储一律十进制: 1KB=1000B, 1MB=1000KB, 1GB=1000MB, 1TB=1000GB
 #      手动输入不带单位时按 GB 解释 (500 = 500GB)
+#      显示口径可切换: UNIT_BASE=1024 (默认) / 1000, 只改展示不改字节数
 #   3) nft 计数表独立于用户现有规则, 只有 counter, 无任何 drop/reject
 #   4) 网卡按 /sys/class/net/X/device 判定物理性, 不猜名字
 #   5) 全量明文日志, 变更前后值均记录
@@ -170,16 +171,29 @@ audit() {
 audit_change() { audit "变更 $1: [$2] -> [$3]${4:+  ($4)}"; }
 
 # ---------------------------------------------------------------- 数值工具 (纯 bash)
-# 显示: 真·十进制, 除 1000, 标 B/KB/MB/GB/TB/PB
+# 显示口径: UNIT_BASE 决定除数 (1024 默认 / 1000), 单位标签一律 B/KB/MB/GB/TB/PB
+# 这里只管"怎么显示"。存储与 parse_size 的输入解析始终是十进制字节, 切换口径
+# 不会改动任何已记录的数值 —— 同一个字节数换个除数展示而已。
+# 标签不写 KiB/MiB: 与绝大多数 VPS 商家面板的习惯保持一致。
 fmt_bytes() {
-  local b=${1:-0} u=0 v rem=0
+  local b=${1:-0} u=0 v rem=0 base=${UNIT_BASE:-1024}
   local -a U=(B KB MB GB TB PB)
+  # 配置尚未加载或被外部改坏时兜底。base 落到 0 会让整个显示层除零崩掉
+  [[ $base == 1000 || $base == 1024 ]] || base=1024
   [[ $b =~ ^-?[0-9]+$ ]] || b=0
   (( b < 0 )) && b=0
-  if (( b < 1000 )); then printf '%d B' "$b"; return; fi
+  if (( b < base )); then printf '%d B' "$b"; return; fi
   v=$b
-  while (( v >= 1000 && u < 5 )); do rem=$(( v % 1000 )); v=$(( v / 1000 )); ((u++)); done
-  printf '%d.%02d %s' "$v" "$(( rem / 10 ))" "${U[$u]}"
+  while (( v >= base && u < 5 )); do rem=$(( v % base )); v=$(( v / base )); ((u++)); done
+  # rem 是 base 进制下的余数, 取两位小数必须按 base 归一。
+  # 原先写死的 rem/10 只在 base=1000 时成立, base=1024 时会算出大于 99 的小数位
+  printf '%d.%02d %s' "$v" "$(( rem * 100 / base ))" "${U[$u]}"
+}
+
+# 显示口径的可读描述, 主菜单与诊断页共用
+unit_base_desc() {
+  if [[ ${UNIT_BASE:-1024} == 1000 ]]; then echo "1000 (1KB=1000B)"
+  else echo "1024 (1KB=1024B)"; fi
 }
 
 # 位数预检: bash 的 10#$n 对超长数字会静默回绕成负数, 必须在换算前拦下
@@ -517,6 +531,7 @@ cfg_defaults() {
   ENFORCE_HOST=0; ENFORCE_HOST_AT=100; ENFORCE_HOST_RATE=1M
   ENFORCE_PORT=0; ENFORCE_PORT_RATE=1M; PQUOTA_BASIS=total; RESET_CLEAR_LIMITS=1
   STALE_KEEP_DAYS=30
+  UNIT_BASE=1024
   NFT_TABLE=$NFT_TABLE_DEFAULT
   LOG_LEVEL=$LOG_LEVEL_DEFAULT; LOG_KEEP=$LOG_KEEP_DEFAULT; AUDIT_KEEP=$AUDIT_KEEP_DEFAULT
 }
@@ -534,7 +549,7 @@ cfg_read() {
     case $k in
       IFACE|PUBLIC_IP|SSH_PORT|RESET_DAY|QUOTA|QUOTA_BASIS|COLLECT_INTERVAL|\
       AUTO_DISCOVER|COUNT_FORWARD|ENFORCE_HOST|ENFORCE_HOST_AT|ENFORCE_HOST_RATE|\
-      ENFORCE_PORT|ENFORCE_PORT_RATE|PQUOTA_BASIS|RESET_CLEAR_LIMITS|STALE_KEEP_DAYS|NFT_TABLE|\
+      ENFORCE_PORT|ENFORCE_PORT_RATE|PQUOTA_BASIS|RESET_CLEAR_LIMITS|STALE_KEEP_DAYS|NFT_TABLE|UNIT_BASE|\
       LOG_LEVEL|LOG_KEEP|AUDIT_KEEP)
         printf -v "$k" '%s' "$v" ;;
       *) logw "未知配置项 $k, 已忽略" ;;
@@ -554,6 +569,12 @@ cfg_read() {
   [[ $COLLECT_INTERVAL =~ ^[0-9]+$ ]] && (( COLLECT_INTERVAL >= 1 )) || COLLECT_INTERVAL=5
   [[ $ENFORCE_HOST_AT =~ ^[0-9]+$ ]] || ENFORCE_HOST_AT=100
   [[ $STALE_KEEP_DAYS =~ ^[0-9]+$ ]] || STALE_KEEP_DAYS=30
+  # 显示口径只认 1000 / 1024, 其它值一律回落 1024。不能并入上面的 10# 归一循环:
+  # 那里只做进制归一, 会把 999 之类的任意数字原样留下, 落到 fmt_bytes 就是拿垃圾值做除数
+  if [[ ${UNIT_BASE:-} != 1000 && ${UNIT_BASE:-} != 1024 ]]; then
+    [[ -n ${UNIT_BASE:-} ]] && logw "配置项 UNIT_BASE 值非法 [$UNIT_BASE], 已回落默认 1024"
+    UNIT_BASE=1024
+  fi
   [[ $LOG_KEEP =~ ^[0-9]+$ ]] && (( LOG_KEEP >= 50 )) || LOG_KEEP=300
   [[ $AUDIT_KEEP =~ ^[0-9]+$ ]] && (( AUDIT_KEEP >= 50 )) || AUDIT_KEEP=1000
   # 表名非法会导致 nft 操作误伤其它表, 必须回落默认
@@ -629,6 +650,7 @@ cfg_save() {
 # trafmgr 配置  v$VERSION   auto = 运行时自动探测
 # SSH_PORT 可写 auto, 或逗号分隔多个端口如 22,22123 (仍会并入自动探测结果)
 # QUOTA 为字节数, 十进制口径 (1GB = 1000000000 字节)
+# UNIT_BASE 仅影响显示换算 (1024 默认 / 1000), 不改变上面 QUOTA 的字节口径
 IFACE=$IFACE
 PUBLIC_IP=$PUBLIC_IP
 SSH_PORT=$SSH_PORT
@@ -646,6 +668,7 @@ ENFORCE_PORT_RATE=$ENFORCE_PORT_RATE
 PQUOTA_BASIS=$PQUOTA_BASIS
 RESET_CLEAR_LIMITS=$RESET_CLEAR_LIMITS
 STALE_KEEP_DAYS=$STALE_KEEP_DAYS
+UNIT_BASE=$UNIT_BASE
 NFT_TABLE=$NFT_TABLE
 LOG_LEVEL=$LOG_LEVEL
 LOG_KEEP=$LOG_KEEP
@@ -2179,7 +2202,7 @@ ask_size() {   # $1=提示 $2=默认 -> SIZE_VAL
       SIZE_VAL=$v
       # 纯数字输入时明确提示按 GB 解释, 防止用户以为填的是 MB 或字节
       [[ $REPLY_VAL =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( v > 0 )) \
-        && printf '  %s已按 GB 解释: %s = %s%s\n' "$C_D" "$REPLY_VAL" "$(fmt_bytes "$v")" "$C_R"
+        && printf '  %s已按十进制 GB 解释: %s GB = %s 字节, 显示为 %s%s\n' "$C_D" "$REPLY_VAL" "$v" "$(fmt_bytes "$v")" "$C_R"
       return 0
     fi
     printf '  %s格式无法识别。直接填数字按 GB 计 (500 = 500GB), 也可写 500G / 2T / 4.5TB / 800M%s\n' "$C_E" "$C_R"
@@ -2213,7 +2236,7 @@ menu_quota() {
     printf '    时区          %s\n' "$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo 未知)"
     (( ${QUOTA:-0} > 0 )) && printf '    按当前口径    已用 %s / %s   %s\n' "$(fmt_bytes "$used")" "$(fmt_bytes "$QUOTA")" "$(pct_str "$used" "$QUOTA")"
     printf '    其他口径参考  上传 %s   下载 %s   合计 %s\n' "$(fmt_bytes "$u")" "$(fmt_bytes "$d")" "$(fmt_bytes "$((u+d))")"
-    printf '    %s容量单位十进制; 输入数字不带单位按 GB 计%s\n' "$C_D" "$C_R"
+    printf '    %s输入十进制, 数字不带单位按 GB 计; 当前显示口径 %s%s\n' "$C_D" "$(unit_base_desc)" "$C_R"
     echo
     echo "    1)  修改配额额度"
     echo "    2)  修改计费口径"
@@ -2639,7 +2662,7 @@ menu_diag() {
   [[ -n ${cmax:-} ]] && printf '  %s %s\n' "$(padr "conntrack" 14)" "$ccur / $cmax$( (( ${cmax:-1} > 0 && ${ccur:-0} * 100 / cmax > 70 )) && printf '   %s使用率偏高%s' "$C_Y" "$C_R" )"
   printf '  %s %s\n' "$(padr "awk 实现" 14)" "$(awk -W version 2>&1 | head -1 || awk --version 2>/dev/null | head -1)"
   printf '  %s %s\n' "$(padr "数值运算" 14)" "全部使用 bash 64 位整数, 不经 awk"
-  printf '  %s %s\n' "$(padr "容量单位" 14)" "十进制 1KB=1000B; 输入不带单位按 GB 解释"
+  printf '  %s %s\n' "$(padr "容量单位" 14)" "显示 $(unit_base_desc); 输入十进制, 不带单位按 GB 解释"
   printf '  %s %s\n' "$(padr "速率单位" 14)" "比特率 1M=1Mbps; 下发 nft 时换算为 kbytes(1024B)/second"
   printf '  %s %s\n' "$(padr "回环豁免" 14)" "计数与限速均跳过 lo, 本地互访不计流量/不限速"
   printf '  %s %s\n' "$(padr "转发限速" 14)" "转发端口走 forward 链 (ct original proto-dst), 本机端口走 input/output"
@@ -2982,7 +3005,7 @@ do_install() {
     printf '    计费重置日    每月 1 号\n'
     printf '    配额额度      未设置   仅统计, 不做任何限制\n'
     printf '    计费口径      合计  上传 + 下载\n'
-    printf '    容量单位      十进制 KB/MB/GB/TB   输入不带单位按 GB 计\n'
+    printf '    容量单位      输入十进制, 不带单位按 GB 计; 显示 1024 进制\n'
     printf '    采集间隔      5 分钟\n'
     printf '    端口自动发现  开启   下线端口保留 30 天\n'
     printf '    超额限制      关闭   整机与端口均关闭\n'
@@ -3046,7 +3069,8 @@ do_install() {
     echo
     echo "  提示  未设置配额时仅统计不限制"
     echo "        如需超额保护, 在菜单 2 设置配额, 菜单 3 开启限制"
-    echo "  单位  容量为十进制 KB/MB/GB/TB, 填数字不带单位按 GB 计"
+    echo "  单位  输入十进制, 填数字不带单位按 GB 计; 显示默认 1024 进制"
+    echo "        主菜单 u 可在 1024 / 1000 之间切换显示口径"
     echo "  日志  运行 $LOG"
     echo "        审计 $AUDIT   记录所有配置变更及变更前原值"
     pause
@@ -3258,6 +3282,7 @@ main_menu() {
     printf '  %s8)%s 系统诊断\n'            "$C_B" "$C_R"
     printf '  %s9)%s 运行日志\n'            "$C_B" "$C_R"
     printf '  %sh)%s 历史用量\n'            "$C_B" "$C_R"
+    printf '  %su)%s 显示单位  当前 %s\n'     "$C_B" "$C_R" "$(unit_base_desc)"
     printf '  %s0)%s 退出\n'                "$C_B" "$C_R"
     printf '\n  回车 = 刷新   请选择: '
     if ! read -r c; then echo; echo "  输入已结束, 退出。"; exit 0; fi
@@ -3282,6 +3307,12 @@ main_menu() {
       8) menu_diag ;;
       9) menu_log ;;
       h|H) clear 2>/dev/null; show_history; pause ;;
+      u|U) local _nb
+           [[ ${UNIT_BASE:-1024} == 1024 ]] && _nb=1000 || _nb=1024
+           if cfg_set UNIT_BASE "$_nb"; then
+             printf '  显示单位已切换为 %s   仅改变展示, 已记录的字节数未变动\n' "$(unit_base_desc)"
+           fi
+           pause ;;
       0) echo; exit 0 ;;
       refresh) ;;
       *) echo "  无效选择"; pause ;;
@@ -3302,7 +3333,7 @@ do_status() {
   printf 'enforce_host=%s enforce_port=%s limited=%s\n' "${ENFORCE_HOST:-0}" "${ENFORCE_PORT:-0}" "$( enforce_host_active && echo yes || echo no )"
   printf 'ssh_exempt=%s\n' "${RSSH_LIST:-$RSSH}"
   printf 'iface_ok=%s\n' "$( require_iface && echo yes || echo "no:${IFACE_ERR:-unknown}" )"
-  printf 'unit=decimal (1KB=1000B)\n'
+  printf 'unit_store=decimal (1KB=1000B) unit_display=%s\n' "${UNIT_BASE:-1024}"
   printf 'human: 本期 上传 %s 下载 %s 合计 %s | 累计 %s\n' \
     "$(fmt_bytes "$u")" "$(fmt_bytes "$d")" "$(fmt_bytes "$((u+d))")" "$(fmt_bytes "$((lu+ld))")"
 }
@@ -3333,9 +3364,11 @@ trafmgr v$VERSION  流量统计与管理
   bash <(curl -sL URL) 5      打印状态后退出, 巡检/批量采集用
 
 单位说明:
-  容量  十进制  1KB=1000B  1MB=1000KB  1GB=1000MB  1TB=1000GB
+  容量  输入与存储一律十进制  1KB=1000B  1MB=1000KB  1GB=1000MB  1TB=1000GB
         手动输入不带单位时按 GB 解释, 如 500 即 500GB
         显式写 KiB/MiB/GiB/TiB 时按 1024 换算
+        显示口径默认 1024, 标签仍写 KB/MB/GB; 主菜单 u 可切回 1000
+        切换只影响展示, 已记录的字节数与配额额度均不变动
   速率  比特率  1M = 1Mbps = 1000000 bit/s
 
 已安装后同样可用: trafmgr / trafmgr 1 / trafmgr 5 ...
