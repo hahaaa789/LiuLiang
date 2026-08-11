@@ -4,13 +4,12 @@
 #
 # 设计要点:
 #   1) 所有数值运算走 bash 64 位整数, awk 只处理文本 (规避 mawk 32 位截断)
-#   2) 输入与存储一律十进制: 不带单位按 GB 解释 (500 = 500GB = 500000000000 字节)
-#      显式写 KiB/MiB/GiB 时才按 1024 解析
-#   3) 显示口径可切换: UNIT_BASE=1024 (默认) / 1000, 标签统一 KB/MB/GB
-#      只改展示不改字节数, 配额额度与历史统计均不受影响
-#   4) nft 计数表独立于用户现有规则, 只有 counter, 无任何 drop/reject
-#   5) 网卡按 /sys/class/net/X/device 判定物理性, 不猜名字
-#   6) 全量明文日志, 变更前后值均记录
+#   2) 容量口径可切换: UNIT_BASE=1024 (默认) / 1000, 输入解析与显示同时跟随
+#      切换时配额自动按新口径重算, 界面数字不变; 实测流量字节数不动
+#      不带单位按 GB 解释; 显式写 KiB/MiB/GiB 恒按 1024, 不受 UNIT_BASE 影响
+#   3) nft 计数表独立于用户现有规则, 只有 counter, 无任何 drop/reject
+#   4) 网卡按 /sys/class/net/X/device 判定物理性, 不猜名字
+#   5) 全量明文日志, 变更前后值均记录
 #
 # 几条容易被"顺手改掉"的约定, 动手前请先读:
 #
@@ -18,6 +17,10 @@
 #     两位小数写的是 rem*100/base 而不是 rem/10。后者只在 base=1000 时成立,
 #     base=1024 时余数最大 1023, 除以 10 会得到三位数, %02d 会印出 "1.102 KB"。
 #     改这行前先用 1048575 (=1024*1024-1) 验证, 正确输出是 1023.99 KB。
+#
+#   UNIT_BASE 不适用于速率
+#     速率是比特率, 网络界恒为十进制 (1Mbps = 10^6 bit/s); 且 nft 的 kbytes
+#     字面就是 1024 字节, 由内核规定。跟着 UNIT_BASE 切会同时改错这两处。
 #
 #   未启用 set -e
 #     本脚本大量函数用返回值传递业务语义 (如 port_add 返回 1 表示"无变化"),
@@ -41,7 +44,7 @@
 #
 set -uo pipefail
 
-VERSION="1.7.2"
+VERSION="1.8.0"
 REPO_RAW="${TRAFMGR_REPO:-https://raw.githubusercontent.com/hahaaa789/LiuLiang/main/LiuLiang}"
 
 # ---------------------------------------------------------------- 路径
@@ -202,16 +205,69 @@ unit_base_desc() {
   else echo "1024 (1KB=1024B)"; fi
 }
 
+# 口径切换时重算"用户填写的额度"。
+# 实测流量不参与重算 —— 那是内核数出来的物理字节数, 改了就是伪造统计;
+# 而配额是用户填的数字, 必须让界面上看到的数字保持不变。
+unit_rescale() {   # <字节数> <旧base> <新base> -> 新字节数
+  local v=${1:-0} ob=${2:-1000} nb=${3:-1024} k=0 t i
+  [[ $v =~ ^[0-9]+$ ]] || { echo 0; return 0; }
+  (( v <= 0 || ob == nb )) && { echo "$v"; return 0; }
+  t=$v
+  while (( t >= ob && k < 5 )); do t=$(( t / ob )); ((k++)); done
+  t=$v
+  # 先除后乘: 直接 t*nb 在 PB 级会溢出 int64
+  for (( i=0; i<k; i++ )); do t=$(( t / ob * nb )); done
+  (( t <= 0 )) && { echo "$v"; return 0; }
+  echo "$t"
+}
+
+# 整体切换容量口径: 配置项 + 整机配额 + 全部端口配额, 一次完成
+UNIT_SWITCH_NQ=0
+unit_switch_base() {   # <新base>
+  local nb=$1 ob=${UNIT_BASE:-1024} oq nq n=0 i
+  UNIT_SWITCH_NQ=0
+  (( nb == ob )) && return 0
+  oq=${QUOTA:-0}; nq=$(unit_rescale "$oq" "$ob" "$nb")
+  # 配额先落到内存, 让 cfg_set 触发的 cfg_save 一并写盘; 失败则整体回滚
+  QUOTA=$nq
+  if ! cfg_set UNIT_BASE "$nb"; then
+    QUOTA=$oq
+    loge "容量口径切换失败, 配额已回滚为 [$oq]"
+    return 1
+  fi
+  (( oq != nq )) && audit_change "配额额度(口径 $ob->$nb 重算)" "$oq" "$nq"
+  # 端口配额: 先整体读入再逐条写回, 避免边读边改同一文件
+  local -a _pk=() _pv=()
+  local k v
+  while IFS=$'\t' read -r k v; do
+    [[ -z ${k:-} || ${k} == \#* ]] && continue
+    [[ $v =~ ^[0-9]+$ ]] || continue
+    _pk+=("$k"); _pv+=("$v")
+  done < <(cat "$PQUOTA" 2>/dev/null)
+  for (( i=0; i<${#_pk[@]}; i++ )); do
+    local _nv; _nv=$(unit_rescale "${_pv[$i]}" "$ob" "$nb")
+    (( _nv == ${_pv[$i]} )) && continue
+    tsv_put "$PQUOTA" "${_pk[$i]}" "$_nv" && n=$(( n + 1 ))
+  done
+  (( n > 0 )) && audit "容量口径 $ob -> $nb: 已重算 $n 个端口配额"
+  UNIT_SWITCH_NQ=$n
+  return 0
+}
+
 # 位数预检: bash 的 10#$n 对超长数字会静默回绕成负数, 必须在换算前拦下
 _digits_ok() { local s=${1:-}; (( ${#s} > 0 && ${#s} <= 18 )); }
 
-# 输入: 不带单位一律按 GB; K/M/G/T/P 为十进制; 显式 KiB/MiB/... 才按 1024
+# 输入: 不带单位按 GB; K/M/G/T/P 跟随 UNIT_BASE; 显式 KiB/MiB/... 恒按 1024
 parse_size() {
   local s=${1// /}
   s=$(printf '%s' "$s" | tr '[:lower:]' '[:upper:]')
   [[ -z $s ]] && { echo 0; return 0; }
   [[ $s =~ ^([0-9]+)(\.([0-9]+))?(B|K|KB|KIB|M|MB|MIB|G|GB|GIB|T|TB|TIB|P|PB|PIB)?$ ]] || { echo ERR; return 1; }
   local ip=${BASH_REMATCH[1]} fp=${BASH_REMATCH[3]} un=${BASH_REMATCH[4]:-G} mult=1
+  # 基数跟随 UNIT_BASE: 口径切了, 输入解析必须一起切。否则 1024 口径下填 500,
+  # 存进去的是 500*10^9, 界面按 1024 换算回来显示 465.66 GB, 与填的数字对不上
+  local base=${UNIT_BASE:-1024}
+  [[ $base == 1000 || $base == 1024 ]] || base=1024
   # 必须先查位数再做 10# 转换; 顺序反了等于没有溢出防护
   _digits_ok "$ip" || { echo ERR; return 1; }
   # 前导零会被 bash 当八进制, 08/09 直接报错, 必须用 10# 强制十进制
@@ -219,9 +275,10 @@ parse_size() {
   fp="${fp}000"; fp=${fp:0:3}
   case $un in
     B)    mult=1 ;;
-    K|KB) mult=1000 ;;          M|MB) mult=$((1000**2)) ;;
-    G|GB) mult=$((1000**3)) ;;  T|TB) mult=$((1000**4)) ;;
-    P|PB) mult=$((1000**5)) ;;
+    K|KB) mult=$base ;;         M|MB) mult=$((base**2)) ;;
+    G|GB) mult=$((base**3)) ;;  T|TB) mult=$((base**4)) ;;
+    P|PB) mult=$((base**5)) ;;
+    # i 系后缀是显式二进制写法, 恒 1024, 不受 UNIT_BASE 影响
     KIB)  mult=1024 ;;          MIB)  mult=$((1024**2)) ;;
     GIB)  mult=$((1024**3)) ;;  TIB)  mult=$((1024**4)) ;;
     PIB)  mult=$((1024**5)) ;;
@@ -655,8 +712,8 @@ cfg_save() {
   if ! cat > "$_cfgtmp" <<EOF
 # trafmgr 配置  v$VERSION   auto = 运行时自动探测
 # SSH_PORT 可写 auto, 或逗号分隔多个端口如 22,22123 (仍会并入自动探测结果)
-# QUOTA 为字节数, 十进制口径 (1GB = 1000000000 字节)
-# UNIT_BASE 仅影响显示换算 (1024 默认 / 1000), 不改变上面 QUOTA 的字节口径
+# QUOTA 为字节数; 其口径由 UNIT_BASE 决定 (1GB = UNIT_BASE^3 字节)
+# UNIT_BASE 同时作用于显示换算与输入解析; 切换请走菜单 u, 它会一并重算配额
 IFACE=$IFACE
 PUBLIC_IP=$PUBLIC_IP
 SSH_PORT=$SSH_PORT
@@ -2206,9 +2263,9 @@ ask_size() {   # $1=提示 $2=默认 -> SIZE_VAL
     v=$(parse_size "$REPLY_VAL")
     if [[ $v != ERR ]]; then
       SIZE_VAL=$v
-      # 纯数字输入时明确提示按 GB 解释, 防止用户以为填的是 MB 或字节
+      # 纯数字输入时明确回显解释结果, 防止用户以为填的是 MB 或字节
       [[ $REPLY_VAL =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( v > 0 )) \
-        && printf '  %s已按十进制 GB 解释: %s GB = %s 字节, 显示为 %s%s\n' "$C_D" "$REPLY_VAL" "$v" "$(fmt_bytes "$v")" "$C_R"
+        && printf '  %s已按 GB 解释 (口径 %s): %s GB = %s 字节, 显示为 %s%s\n' "$C_D" "${UNIT_BASE:-1024}" "$REPLY_VAL" "$v" "$(fmt_bytes "$v")" "$C_R"
       return 0
     fi
     printf '  %s格式无法识别。直接填数字按 GB 计 (500 = 500GB), 也可写 500G / 2T / 4.5TB / 800M%s\n' "$C_E" "$C_R"
@@ -2242,13 +2299,14 @@ menu_quota() {
     printf '    时区          %s\n' "$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo 未知)"
     (( ${QUOTA:-0} > 0 )) && printf '    按当前口径    已用 %s / %s   %s\n' "$(fmt_bytes "$used")" "$(fmt_bytes "$QUOTA")" "$(pct_str "$used" "$QUOTA")"
     printf '    其他口径参考  上传 %s   下载 %s   合计 %s\n' "$(fmt_bytes "$u")" "$(fmt_bytes "$d")" "$(fmt_bytes "$((u+d))")"
-    printf '    %s输入十进制, 数字不带单位按 GB 计; 当前显示口径 %s%s\n' "$C_D" "$(unit_base_desc)" "$C_R"
+    printf '    %s数字不带单位按 GB 计; 当前容量口径 %s%s\n' "$C_D" "$(unit_base_desc)" "$C_R"
     echo
     echo "    1)  修改配额额度"
     echo "    2)  修改计费口径"
     echo "    3)  修改每月重置日"
     echo "    4)  手动校准本期已用量"
     echo "    5)  立即重置本期计数"
+    echo "    6)  切换容量口径      1024 / 1000"
     echo "    0)  返回"
     printf '\n  回车返回\n  请选择: '
     read -r c || return 0
@@ -2299,6 +2357,30 @@ menu_quota() {
              echo "  已重置 (周期重置自动解除已关闭, 超额限速仍保留)"
            fi
          else echo "  已取消"; fi; pause ;;
+      6) local _ob=${UNIT_BASE:-1024} _nb
+         [[ $_ob == 1024 ]] && _nb=1000 || _nb=1024
+         echo
+         printf '  容量口径 %s -> %s\n' "$(unit_base_desc)" "$( [[ $_nb == 1000 ]] && echo "1000 (1KB=1000B)" || echo "1024 (1KB=1024B)" )"
+         echo
+         echo "  会跟着切:"
+         echo "    显示换算 / 输入解析 (填 500 仍是 500GB, 只是底层字节数换算方式变了)"
+         printf '    整机配额 %s\n' "$( (( ${QUOTA:-0} > 0 )) && printf '%s -> 数字不变, 底层字节重算' "$(fmt_bytes "$QUOTA")" || echo "未设置" )"
+         printf '    端口配额 %s 个 -> 数字不变, 底层字节重算\n' "$(nlines "$PQUOTA")"
+         echo
+         echo "  不会动:"
+         echo "    已统计的实际流量字节数 (物理计数, 改了等于伪造统计)"
+         printf '      本期已用 %s  ->  换算后显示 %s\n' "$(fmt_bytes "$used")" "$( UNIT_BASE=$_nb fmt_bytes "$used" )"
+         echo "    速率设置 (比特率恒十进制, nft kbytes 由内核规定为 1024B)"
+         echo
+         if confirm "确认切换容量口径"; then
+           if unit_switch_base "$_nb"; then
+             printf '  已切换为 %s\n' "$(unit_base_desc)"
+             (( ${UNIT_SWITCH_NQ:-0} > 0 )) && printf '  同时重算 %s 个端口配额\n' "$UNIT_SWITCH_NQ"
+             # 配额底层字节数变了, 超额判定结果可能随之改变, 立即回收一次
+             enforce_reap_host; enforce_reap_ports
+           fi
+         else echo "  已取消"; fi
+         pause ;;
       0|"") return ;;
       *) echo "  无效选择"; pause ;;
     esac
@@ -2668,7 +2750,7 @@ menu_diag() {
   [[ -n ${cmax:-} ]] && printf '  %s %s\n' "$(padr "conntrack" 14)" "$ccur / $cmax$( (( ${cmax:-1} > 0 && ${ccur:-0} * 100 / cmax > 70 )) && printf '   %s使用率偏高%s' "$C_Y" "$C_R" )"
   printf '  %s %s\n' "$(padr "awk 实现" 14)" "$(awk -W version 2>&1 | head -1 || awk --version 2>/dev/null | head -1)"
   printf '  %s %s\n' "$(padr "数值运算" 14)" "全部使用 bash 64 位整数, 不经 awk"
-  printf '  %s %s\n' "$(padr "容量单位" 14)" "显示 $(unit_base_desc); 输入十进制, 不带单位按 GB 解释"
+  printf '  %s %s\n' "$(padr "容量口径" 14)" "$(unit_base_desc); 输入解析与显示同口径, 不带单位按 GB"
   printf '  %s %s\n' "$(padr "速率单位" 14)" "比特率 1M=1Mbps; 下发 nft 时换算为 kbytes(1024B)/second"
   printf '  %s %s\n' "$(padr "回环豁免" 14)" "计数与限速均跳过 lo, 本地互访不计流量/不限速"
   printf '  %s %s\n' "$(padr "转发限速" 14)" "转发端口走 forward 链 (ct original proto-dst), 本机端口走 input/output"
@@ -3011,7 +3093,7 @@ do_install() {
     printf '    计费重置日    每月 1 号\n'
     printf '    配额额度      未设置   仅统计, 不做任何限制\n'
     printf '    计费口径      合计  上传 + 下载\n'
-    printf '    容量单位      输入十进制, 不带单位按 GB 计; 显示 1024 进制\n'
+    printf '    容量口径      1024 (1KB=1024B)   输入与显示同口径, 不带单位按 GB 计\n'
     printf '    采集间隔      5 分钟\n'
     printf '    端口自动发现  开启   下线端口保留 30 天\n'
     printf '    超额限制      关闭   整机与端口均关闭\n'
@@ -3075,8 +3157,8 @@ do_install() {
     echo
     echo "  提示  未设置配额时仅统计不限制"
     echo "        如需超额保护, 在菜单 2 设置配额, 菜单 3 开启限制"
-    echo "  单位  输入十进制, 填数字不带单位按 GB 计; 显示默认 1024 进制"
-    echo "        主菜单 u 可在 1024 / 1000 之间切换显示口径"
+    echo "  单位  容量口径默认 1024 (1KB=1024B), 填数字不带单位按 GB 计"
+    echo "        主菜单 u 可切到 1000 口径, 输入/显示/配额会一并跟着切"
     echo "  日志  运行 $LOG"
     echo "        审计 $AUDIT   记录所有配置变更及变更前原值"
     pause
@@ -3288,7 +3370,6 @@ main_menu() {
     printf '  %s8)%s 系统诊断\n'            "$C_B" "$C_R"
     printf '  %s9)%s 运行日志\n'            "$C_B" "$C_R"
     printf '  %sh)%s 历史用量\n'            "$C_B" "$C_R"
-    printf '  %su)%s 显示单位  当前 %s\n'     "$C_B" "$C_R" "$(unit_base_desc)"
     printf '  %s0)%s 退出\n'                "$C_B" "$C_R"
     printf '\n  回车 = 刷新   请选择: '
     if ! read -r c; then echo; echo "  输入已结束, 退出。"; exit 0; fi
@@ -3313,12 +3394,6 @@ main_menu() {
       8) menu_diag ;;
       9) menu_log ;;
       h|H) clear 2>/dev/null; show_history; pause ;;
-      u|U) local _nb
-           [[ ${UNIT_BASE:-1024} == 1024 ]] && _nb=1000 || _nb=1024
-           if cfg_set UNIT_BASE "$_nb"; then
-             printf '  显示单位已切换为 %s   仅改变展示, 已记录的字节数未变动\n' "$(unit_base_desc)"
-           fi
-           pause ;;
       0) echo; exit 0 ;;
       refresh) ;;
       *) echo "  无效选择"; pause ;;
@@ -3339,7 +3414,7 @@ do_status() {
   printf 'enforce_host=%s enforce_port=%s limited=%s\n' "${ENFORCE_HOST:-0}" "${ENFORCE_PORT:-0}" "$( enforce_host_active && echo yes || echo no )"
   printf 'ssh_exempt=%s\n' "${RSSH_LIST:-$RSSH}"
   printf 'iface_ok=%s\n' "$( require_iface && echo yes || echo "no:${IFACE_ERR:-unknown}" )"
-  printf 'unit_store=decimal (1KB=1000B) unit_display=%s\n' "${UNIT_BASE:-1024}"
+  printf 'unit_base=%s (1KB=%sB, 输入与显示同口径)\n' "${UNIT_BASE:-1024}" "${UNIT_BASE:-1024}"
   printf 'human: 本期 上传 %s 下载 %s 合计 %s | 累计 %s\n' \
     "$(fmt_bytes "$u")" "$(fmt_bytes "$d")" "$(fmt_bytes "$((u+d))")" "$(fmt_bytes "$((lu+ld))")"
 }
@@ -3370,11 +3445,11 @@ trafmgr v$VERSION  流量统计与管理
   bash <(curl -sL URL) 5      打印状态后退出, 巡检/批量采集用
 
 单位说明:
-  容量  输入与存储一律十进制  1KB=1000B  1MB=1000KB  1GB=1000MB  1TB=1000GB
-        手动输入不带单位时按 GB 解释, 如 500 即 500GB
-        显式写 KiB/MiB/GiB/TiB 时按 1024 换算
-        显示口径默认 1024, 标签仍写 KB/MB/GB; 主菜单 u 可切回 1000
-        切换只影响展示, 已记录的字节数与配额额度均不变动
+  容量  口径由 UNIT_BASE 决定: 1024 (默认) 或 1000, 输入解析与显示始终一致
+        不带单位按 GB 解释, 如 500 即 500GB
+        显式写 KiB/MiB/GiB/TiB 时恒按 1024, 不受 UNIT_BASE 影响
+        主菜单 u 可切换口径; 切换时配额自动重算, 界面数字不变
+        已统计的实际流量字节数不受切换影响
   速率  比特率  1M = 1Mbps = 1000000 bit/s
 
 已安装后同样可用: trafmgr / trafmgr 1 / trafmgr 5 ...
