@@ -44,7 +44,7 @@
 #
 set -uo pipefail
 
-VERSION="1.8.0"
+VERSION="1.8.1"
 REPO_RAW="${TRAFMGR_REPO:-https://raw.githubusercontent.com/hahaaa789/LiuLiang/main/LiuLiang}"
 
 # ---------------------------------------------------------------- 路径
@@ -1278,24 +1278,84 @@ port_mark_gone() {
 }
 
 # 自动清理: 长期下线且本周期无流量的条目
+# 批量实现: 循环内不启动任何外部命令, 也不逐行重写文件。
+#   1) 截止时刻只算一次。last_seen 是定宽的 'YYYY-MM-DD HH:MM:SS', 字典序即
+#      时间序, 直接交给 awk 做字符串比较, 不必逐行 date -d 换算成秒。
+#   2) 本周期流量一次读入建索引, 取代逐条 acc_get (后者每次都全表 awk + cut)。
+#   3) 命中项一次性摘除, 取代逐条 tsv_del + port_purge_refs (后者每删一个就
+#      全表重写一次, 且每次都可能重建限速表)。
+# 端口表堆积到 2 万条 gone 时, 旧实现每轮耗时以分钟计, 而采集间隔只有 5 分钟,
+# 表现为 cat 长期挂在管道上、CPU 持续跑满。批量化后同等规模在毫秒级完成。
+# 按键整体过滤: 删掉 dead 列表中出现的键 (第一列精确匹配)
+_gc_filter_key() {   # <目标文件> <待删键文件>
+  local f=$1 dead=$2 tmp
+  tmp=$(mktemp "${f}.XXXXXX") || return 1
+  awk -F'\t' 'FNR==NR{D[$1]=1;next} !($1 in D){print}' "$dead" "$f" > "$tmp" 2>/dev/null \
+    || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" 2>/dev/null
+  mv -f "$tmp" "$f" || { rm -f "$tmp"; return 1; }
+  return 0
+}
+# 按前缀过滤: limits 的键是 "<端口键>_<方向>", 去掉最后一段再与 dead 比对。
+# 端口键形如 60000/udp, 不含下划线, 故截最后一个 _ 之后的内容即可还原端口键。
+_gc_filter_pfx() {   # <目标文件> <待删键文件>
+  local f=$1 dead=$2 tmp
+  tmp=$(mktemp "${f}.XXXXXX") || return 1
+  awk -F'\t' 'FNR==NR{D[$1]=1;next}
+    { k=$1; sub(/_[^_]*$/,"",k); if(k in D) next; print }' "$dead" "$f" > "$tmp" 2>/dev/null \
+    || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" 2>/dev/null
+  mv -f "$tmp" "$f" || { rm -f "$tmp"; return 1; }
+  return 0
+}
 port_gc() {
-  local keep=${STALE_KEEP_DAYS:-30} now cutoff n=0
+  local keep=${STALE_KEEP_DAYS:-30} cut dead n=0 nl=0
   (( keep <= 0 )) && return 0
-  now=$(date +%s); cutoff=$(( now - keep * 86400 ))
-  local k proto port kind note src first state last ls u d
-  while IFS=$'\t' read -r k proto port kind note src first state last; do
-    [[ -z ${k:-} ]] && continue
-    [[ ${state:-live} == gone ]] || continue
-    ls=$(date -d "${last:-1970-01-01}" +%s 2>/dev/null || echo 0)
-    (( ls > cutoff )) && continue
-    read -r u d <<<"$(acc_get "$k" "$CYCLE")"
-    (( u + d > 0 )) && continue
-    tsv_del "$PORTS" "$k"
-    audit "自动清理端口 $k  已下线超过 ${keep} 天且本周期无流量"
-    port_purge_refs "$k"
-    n=$(( n + 1 ))
-  done < <(cat "$PORTS" 2>/dev/null)
-  (( n > 0 )) && logi "端口清理完成, 移除 $n 个陈旧条目"
+  [[ -f $PORTS ]] || return 0
+  # 唯一一次 date: 把截止时刻算成与 last_seen 同格式的字面量
+  cut=$(date -d "@$(( $(date +%s) - keep * 86400 ))" '+%F %T' 2>/dev/null)
+  [[ -n ${cut:-} ]] || { loge "端口清理中止: 无法计算截止时间"; return 1; }
+  mkdir -p "$LIB_DIR" 2>/dev/null
+  dead=$(mktemp "${LIB_DIR}/gc.XXXXXX") || { loge "端口清理中止: mktemp 失败"; return 1; }
+  # 第一遍读 cycle 建"本周期有流量"索引, 第二遍扫 ports 直接产出待删键。
+  # 不用 {n} 区间量词, 保证 mawk (Debian/Ubuntu 默认 awk) 下行为一致。
+  awk -F'\t' -v cut="$cut" '
+    FNR==NR { if($1!="" && ($2+0)+($3+0)>0) act[$1]=1; next }
+    {
+      if ($1=="" || $1 ~ /^#/) next
+      if (($8==""?"live":$8) != "gone") next
+      ls=$9
+      if (ls !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/) \
+        ls="1970-01-01 00:00:00"
+      if (ls > cut) next
+      if ($1 in act) next
+      print $1
+    }' "$CYCLE" "$PORTS" > "$dead" 2>/dev/null
+  n=$(grep -c . "$dead" 2>/dev/null); [[ $n =~ ^[0-9]+$ ]] || n=0
+  (( n == 0 )) && { rm -f "$dead"; return 0; }
+  # 三个文件各自在锁内一次性重写, 与 tsv_put / tsv_del 用同一把锁
+  if ! with_lock "$PORTS" _gc_filter_key "$PORTS" "$dead"; then
+    loge "端口清理失败: 无法重写 $PORTS, 本轮未做任何删除"
+    rm -f "$dead"; return 1
+  fi
+  if [[ -f $PQUOTA ]]; then
+    with_lock "$PQUOTA" _gc_filter_key "$PQUOTA" "$dead" || logw "端口清理: $PQUOTA 未能同步摘除"
+  fi
+  if [[ -f $LIMITS ]]; then
+    nl=$(awk -F'\t' 'FNR==NR{D[$1]=1;next}
+      { k=$1; sub(/_[^_]*$/,"",k); if(k in D) n++ } END{print n+0}' "$dead" "$LIMITS" 2>/dev/null)
+    [[ $nl =~ ^[0-9]+$ ]] || nl=0
+    (( nl > 0 )) && { with_lock "$LIMITS" _gc_filter_pfx "$LIMITS" "$dead" || nl=0; }
+  fi
+  rm -f "$dead"
+  # 逐条 audit 在万级规模下会把审计日志整个冲掉, 故只记汇总
+  if (( nl > 0 )); then
+    audit "自动清理端口 $n 个 (下线超过 ${keep} 天且本周期无流量), 连带移除限速规则 $nl 条"
+    nft_limit_build      # 限速表只重建一次, 不在循环里反复建
+  else
+    audit "自动清理端口 $n 个 (下线超过 ${keep} 天且本周期无流量)"
+  fi
+  logi "端口清理完成, 移除 $n 个陈旧条目"
   return 0
 }
 
